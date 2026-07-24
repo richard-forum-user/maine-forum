@@ -1,0 +1,60 @@
+name = "podlink-pod"
+main = "secure-worker.js"
+compatibility_date = "2026-05-26"
+compatibility_flags = [ "nodejs_compat" ]
+
+[vars]
+ALLOW_PILOT_BUNDLES = "0"
+# Allowed WebAuthn origins. Add your own pod URL(s) here. The workers.dev
+# origin is filled in after the first deploy; localhost covers desktop/dev.
+WEBAUTHN_ALLOWED_ORIGINS = "https://podlink-pod.workers.dev,http://127.0.0.1:8787,http://localhost:8787"
+# PUBLIC_POD_URL is this pod's own externally reachable base URL. It is used
+# in contact cards / invites so peers know where to deliver messages.
+# Set per deployment, e.g. https://podlink-pod.<subdomain>.workers.dev or your tunnel hostname.
+PUBLIC_POD_URL = ""
+
+# Set the unlock-token signing key via:
+#   npx wrangler secret put UNLOCK_TOKEN_KEY
+
+[[d1_databases]]
+binding = "DB"
+database_name = "podlink-db"
+# Create with: npx wrangler d1 create podlink-db  → paste the id below.
+database_id = "REPLACE_WITH_PODLINK_DB_ID"
+
+[[durable_objects.bindings]]
+name = "POD"
+class_name = "PersonalPodDO"
+
+[[durable_objects.bindings]]
+name = "FAMILY"
+class_name = "FamilyDO"
+
+# R2 bucket for shared family photo albums. Create with:
+#   npx wrangler r2 bucket create podlink-media
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "podlink-media"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PersonalPodDO"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["FamilyDO"]
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+run_worker_first = true
+
+[observability]
+enabled = true
+head_sampling_rate = 0.1
+
+# To serve the pod from your own domain instead of workers.dev, uncomment and
+# set your hostname (requires the zone on your Cloudflare account):
+# [[routes]]
+# pattern = "pod.example.com"
+# custom_domain = true

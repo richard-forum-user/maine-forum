@@ -1,0 +1,26 @@
+# /etc/cloudflared/config.yml — Handover 9 (post DO pivot).
+#
+# CSS, provision bridge, and the Node airlock listener are retired.
+# Pod RPC, cooperative ingest, member registration, and public analysis
+# now run on secure-worker + D1 + PersonalPodDO. Only APK download still
+# needs local tunnel ingress here.
+#
+# Install:
+#   sudo cp ~/Desktop/deploy/cloudflared-config.yml /etc/cloudflared/config.yml
+#   sudo systemctl restart cloudflared
+#
+# Then unbind obsolete pod.*, pod-provision.*, listener.*, and ai-open.*
+# hostnames in the Cloudflare dashboard if they are no longer used.
+#   sudo cloudflared tunnel route dns --overwrite-dns \
+#       e0a398d3-e102-4793-af6f-722df8d921a1 apk.yourcommunity.forum
+
+tunnel: e0a398d3-e102-4793-af6f-722df8d921a1
+credentials-file: /etc/cloudflared/e0a398d3-e102-4793-af6f-722df8d921a1.json
+
+ingress:
+  # APK download host.
+  - hostname: apk.yourcommunity.forum
+    service: http://127.0.0.1:8090
+
+  # Catch-all.
+  - service: http_status:404

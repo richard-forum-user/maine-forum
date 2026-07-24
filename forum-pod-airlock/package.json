@@ -1,0 +1,17 @@
+{
+  "name": "podlink-pod",
+  "private": true,
+  "scripts": {
+    "build:pod": "VITE_ALLOW_PILOT_FALLBACK=0 VITE_WEBAPP_LOCAL_FIRST=1 VITE_BASE=/pod/ npm run build --prefix ../forum-pod && rm -rf dist && cp -r ../forum-pod/dist ./dist",
+    "dev:worker": "npx wrangler dev",
+    "deploy:worker": "npx wrangler deploy",
+    "test": "node --test",
+    "types": "npx wrangler types"
+  },
+  "dependencies": {
+    "@simplewebauthn/server": "^13.1.1"
+  },
+  "devDependencies": {
+    "wrangler": "^3.114.0"
+  }
+}

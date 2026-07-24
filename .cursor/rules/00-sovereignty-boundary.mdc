@@ -1,0 +1,60 @@
+---
+description: podlink sovereignty boundary. Non-negotiable architectural invariants. Applies to all code in this repo.
+alwaysApply: true
+---
+
+# podlink Sovereignty Boundary — non-negotiable
+
+These are architectural invariants, not preferences. If a requested change would
+break any of them, STOP and flag it in plain language; do not write the code.
+
+podlink is a personal, device-to-device encrypted pipeline. There is **no data
+cooperative, no aggregation operator, and no AI** anywhere in the system. Each
+person runs their **own** Pod hub; people message each other directly pod-to-pod.
+
+## One owner, one hub
+- **The Pod is the user's own.** It is hosted on the user's Cloudflare account or
+  on their home machine reached over a Cloudflare Tunnel. There is no third-party
+  operator, no shared relay, and no central server in the message path.
+- A person's devices reach their **own** Pod over signed RPC; messages travel
+  **directly** from the sender's Pod to the recipient's Pod (`/api/inbox`).
+- NEVER introduce a shared/multi-tenant relay, aggregation worker, or operator
+  GPU box. NEVER reintroduce co-op concepts (membership JWTs, cloud sync, Board,
+  egress, cooperative export).
+
+## Plaintext & PII never leave the device
+- Message **plaintext is created and read ONLY on-device.** It is sealed with
+  X25519 ECDH → HKDF → XChaCha20-Poly1305 and signed with Ed25519 before it ever
+  leaves the device.
+- Pods (sender's and recipient's) and the transport handle **ciphertext only**.
+  The `/api/inbox` endpoint MUST reject anything that is not a valid, signed E2E
+  envelope. NEVER store, log, or forward decrypted message content server-side.
+- **Identity is pseudonymous.** A contact card is a random handle + public keys +
+  a Pod URL. No real-world PII (name, email, phone, legal identity) belongs in
+  the identity. A user-chosen display name is optional and user-controlled.
+
+## No AI
+- podlink contains **no AI of any kind** — no model calls, no encyclopedia/chat,
+  no server-side or on-device inference over user content. Do NOT add a model
+  SDK, a `fetch` to a model API, an `AI` binding, or any "assistant" feature.
+
+## Authentication & multi-device
+- Device access to a Pod is gated by an **allowlist** of Ed25519 device keys.
+  The first device TOFU-enrolls as owner; further devices are explicitly
+  authorized, or re-paired via a **recovery-signed** rebind (proof of the
+  phrase-derived recovery key). NEVER weaken this to an open/unauthenticated DO.
+- Every device→Pod request is an Ed25519-signed bundle bound to the device key
+  (`sessionId = pubkey:sha256(publicKeyHex)`); the recipient Pod also verifies
+  the envelope signature on inbound mail.
+
+## Network posture
+- The Pod exposes only: signed `/api/pod` RPC for the owner's devices and a
+  ciphertext-only `/api/inbox` for inbound mail. Home-mode Pods are reached via
+  an OUTBOUND Cloudflare Tunnel — **no open inbound port** on the user's machine.
+- Store-and-forward is **sender-side**: the sender's Pod retries delivery to the
+  recipient Pod with backoff. NEVER buffer plaintext anywhere to achieve this.
+
+## Failure mode
+- A user must always be able to recover their identity from their 12-word phrase
+  and re-pair a new device against their own Pod. Recovery is **pod-local**;
+  never depend on a third party to restore access.

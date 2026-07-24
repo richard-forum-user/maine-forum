@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Family">
+  <rect width="512" height="512" rx="112" fill="#0b0f14"/>
+  <path d="M256 108 L156 196 v168 a16 16 0 0 0 16 16 h168 a16 16 0 0 0 16-16 V196 Z" fill="#11161d" stroke="#4ea1ff" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M256 300c-14-26-56-26-56 8 0 26 40 46 56 58 16-12 56-32 56-58 0-34-42-34-56-8Z" fill="#4ea1ff"/>
+  <circle cx="204" cy="232" r="16" fill="#3fb950"/>
+  <circle cx="308" cy="232" r="16" fill="#d29922"/>
+</svg>

@@ -1,0 +1,12 @@
+{
+  "name": "podlink-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "podlink": "./podlink.mjs"
+  },
+  "scripts": {
+    "setup": "node ./podlink.mjs setup"
+  }
+}

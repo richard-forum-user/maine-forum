@@ -1,0 +1,544 @@
+/**
+ * FamilyDO — one Durable Object per family space, END-TO-END ENCRYPTED.
+ *
+ * The DO stores only ciphertext + public keys. All human-readable content
+ * (post/comment/event bodies, member names, captions) is encrypted on the
+ * client with a shared Family Content Key (FCK) it never sees. The FCK is
+ * distributed by wrapping it to each admitted member's X25519 public key.
+ *
+ * Membership is admin-gated (trust-on-first-use founder = admin):
+ *   - invitees join as `pending` and attach their X pubkey + a name sealed to
+ *     the admin's X key (so the admin can vet them);
+ *   - an admin `admits` them, which uploads the FCK wrapped to their key;
+ *   - `remove` rotates to a new epoch wrapped only to the remaining members.
+ *
+ * Auth remains an Ed25519-signed bundle per device (see pod-signing-web.js).
+ */
+
+import { verifySignedBundle } from "./pod-signing-web.js";
+
+const REPLAY_WINDOW_MS = 5 * 60 * 1000;
+const REPLAY_CLEANUP_GRACE_MS = 60 * 1000;
+const INVITE_MAX_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+export class FamilyDO {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env || {};
+    this.sql = state.storage.sql;
+    this._ready = state.blockConcurrencyWhile(() => this.initSchema());
+  }
+
+  initSchema() {
+    this.sql.exec(`
+      CREATE TABLE IF NOT EXISTS family_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS members (
+        member_pub TEXT PRIMARY KEY,
+        x_pub TEXT,
+        role TEXT NOT NULL DEFAULT 'member',
+        status TEXT NOT NULL DEFAULT 'pending',
+        enc_name TEXT,
+        name_epoch INTEGER,
+        joined_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS join_requests (
+        member_pub TEXT PRIMARY KEY,
+        x_pub TEXT NOT NULL,
+        sealed_name TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS family_keys (
+        member_pub TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        wrapped TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (member_pub, epoch)
+      );
+      CREATE TABLE IF NOT EXISTS posts (
+        id TEXT PRIMARY KEY, author_pub TEXT NOT NULL, epoch INTEGER NOT NULL,
+        ct TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS comments (
+        id TEXT PRIMARY KEY, post_id TEXT NOT NULL, author_pub TEXT NOT NULL,
+        epoch INTEGER NOT NULL, ct TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS reactions (
+        post_id TEXT NOT NULL, member_pub TEXT NOT NULL, emoji TEXT NOT NULL,
+        created_at TEXT NOT NULL, PRIMARY KEY (post_id, member_pub, emoji)
+      );
+      CREATE TABLE IF NOT EXISTS events (
+        id TEXT PRIMARY KEY, created_by TEXT NOT NULL, epoch INTEGER NOT NULL,
+        ct TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS rsvps (
+        event_id TEXT NOT NULL, member_pub TEXT NOT NULL, status TEXT NOT NULL,
+        updated_at TEXT NOT NULL, PRIMARY KEY (event_id, member_pub)
+      );
+      CREATE TABLE IF NOT EXISTS albums (
+        id TEXT PRIMARY KEY, epoch INTEGER NOT NULL, ct TEXT NOT NULL,
+        created_by TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS photos (
+        id TEXT PRIMARY KEY, album_id TEXT NOT NULL, r2_key TEXT NOT NULL,
+        epoch INTEGER NOT NULL, ct TEXT, author_pub TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS replay_guard (
+        signature TEXT PRIMARY KEY, public_key TEXT NOT NULL, seen_at_ms INTEGER NOT NULL
+      );
+    `);
+  }
+
+  // ---- meta / members ----------------------------------------------------
+
+  getMeta(k) {
+    const r = this.sql.exec(`SELECT value FROM family_meta WHERE key = ?`, k).toArray()[0];
+    return r ? r.value : null;
+  }
+  setMeta(k, v) {
+    this.sql.exec(
+      `INSERT INTO family_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      k, String(v)
+    );
+  }
+  currentEpoch() {
+    return Number(this.getMeta("current_epoch") || "1");
+  }
+  memberCount() {
+    return this.sql.exec(`SELECT COUNT(*) AS n FROM members`).toArray()[0].n;
+  }
+  activeAdminXPubs() {
+    return this.sql
+      .exec(`SELECT x_pub FROM members WHERE role = 'admin' AND status = 'active' AND x_pub IS NOT NULL`)
+      .toArray()
+      .map((r) => r.x_pub);
+  }
+  getMember(pub) {
+    return this.sql.exec(`SELECT * FROM members WHERE member_pub = ?`, pub).toArray()[0] || null;
+  }
+
+  checkAndRecordReplay(signature, pub) {
+    const now = Date.now();
+    this.sql.exec(`DELETE FROM replay_guard WHERE seen_at_ms < ?`, now - REPLAY_WINDOW_MS - REPLAY_CLEANUP_GRACE_MS);
+    if (this.sql.exec(`SELECT 1 FROM replay_guard WHERE signature = ?`, signature).toArray()[0]) return true;
+    this.sql.exec(`INSERT INTO replay_guard (signature, public_key, seen_at_ms) VALUES (?, ?, ?)`, signature, pub, now);
+    return false;
+  }
+
+  async tryJoinWithInvite(payload, joinerPub) {
+    if (!payload || payload.verb !== "POST" || payload.path !== "/join") return false;
+    const data = payload.data || {};
+    const token = data.token;
+    if (!token || !token.sig || !token.exp || !token.nonce || !token.admin_pub || !token.admin_x) return false;
+    if (!data.x_pub || !data.sealed_name) return false;
+    const admin = this.getMember(token.admin_pub);
+    if (!admin || admin.role !== "admin") return false;
+    const expMs = Date.parse(token.exp);
+    if (Number.isNaN(expMs) || expMs < Date.now() || expMs - Date.now() > INVITE_MAX_TTL_MS) return false;
+    const message = canonicalObj({ action: "family-invite", admin_x: token.admin_x, exp: token.exp, nonce: token.nonce });
+    if (!(await verifyEd25519(token.admin_pub, token.sig, message))) return false;
+    const now = new Date().toISOString();
+    this.sql.exec(
+      `INSERT INTO members (member_pub, x_pub, role, status, joined_at) VALUES (?, ?, 'member', 'pending', ?)
+       ON CONFLICT(member_pub) DO UPDATE SET x_pub = excluded.x_pub`,
+      joinerPub, data.x_pub, now
+    );
+    this.sql.exec(
+      `INSERT INTO join_requests (member_pub, x_pub, sealed_name, created_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(member_pub) DO UPDATE SET x_pub = excluded.x_pub, sealed_name = excluded.sealed_name`,
+      joinerPub, data.x_pub, JSON.stringify(data.sealed_name), now
+    );
+    return true;
+  }
+
+  // ---- fetch / auth ------------------------------------------------------
+
+  async fetch(request) {
+    await this._ready;
+    if (request.method !== "POST") return jsonResp(405, { error: "use_post" });
+
+    let bundle;
+    try {
+      bundle = await request.json();
+    } catch {
+      return jsonResp(400, { error: "invalid_json" });
+    }
+    const verdict = await verifySignedBundle(bundle, null);
+    if (!verdict.valid) return jsonResp(401, { error: "auth_failed", reason: verdict.reason });
+    const { payload, publicKeyHex } = verdict;
+
+    if (this.checkAndRecordReplay(bundle.signature, publicKeyHex)) {
+      return jsonResp(401, { error: "auth_failed", reason: "replay_detected" });
+    }
+
+    if (!this.getMember(publicKeyHex)) {
+      const isFounding = this.memberCount() === 0;
+      if (isFounding && payload?.verb === "PROVISION") {
+        const now = new Date().toISOString();
+        this.sql.exec(
+          `INSERT INTO members (member_pub, x_pub, role, status, joined_at) VALUES (?, ?, 'admin', 'active', ?)`,
+          publicKeyHex, (payload.data && payload.data.x_pub) || null, now
+        );
+        this.setMeta("created_at", now);
+        this.setMeta("current_epoch", "1");
+      } else if (await this.tryJoinWithInvite(payload, publicKeyHex)) {
+        // enrolled as pending
+      } else if (isFounding) {
+        return jsonResp(404, { error: "family_not_created" });
+      } else {
+        return jsonResp(403, { error: "not_a_member" });
+      }
+    }
+    this._me = this.getMember(publicKeyHex);
+
+    if (!payload || typeof payload !== "object") return jsonResp(400, { error: "invalid_payload" });
+    const verb = String(payload.verb || "").toUpperCase();
+    const path = String(payload.path || "");
+    const data = payload.data || {};
+    if (!verb || !path) return jsonResp(400, { error: "missing_verb_or_path" });
+
+    // Writes (other than joining) require an admitted, active member.
+    const isWrite = verb === "POST" || verb === "PUT" || verb === "DELETE";
+    const joinPaths = new Set(["/join"]);
+    if (isWrite && !joinPaths.has(path) && this._me.status !== "active") {
+      return jsonResp(403, { error: "not_admitted" });
+    }
+
+    try {
+      const result = await this.dispatch(verb, path, data);
+      return jsonResp(result.status || 200, result.body ?? {});
+    } catch (e) {
+      return jsonResp(500, { error: "handler_failed", reason: e?.message || String(e) });
+    }
+  }
+
+  requireAdmin() {
+    return this._me && this._me.role === "admin" && this._me.status === "active";
+  }
+
+  // ---- dispatch ----------------------------------------------------------
+
+  async dispatch(verb, path, data) {
+    const me = this._me;
+
+    // ---- family / identity ----
+    if (verb === "PROVISION" && path === "/") {
+      const epoch = this.currentEpoch();
+      if (data.enc_family_name) this.setMeta("enc_family_name", JSON.stringify(data.enc_family_name));
+      if (data.x_pub) this.sql.exec(`UPDATE members SET x_pub = ? WHERE member_pub = ?`, data.x_pub, me.member_pub);
+      if (data.enc_name) {
+        this.sql.exec(
+          `UPDATE members SET enc_name = ?, name_epoch = ? WHERE member_pub = ?`,
+          JSON.stringify(data.enc_name), epoch, me.member_pub
+        );
+      }
+      // Founder seeds the epoch-1 key wrapped to themselves.
+      if (data.wrapped_self) {
+        this.sql.exec(
+          `INSERT INTO family_keys (member_pub, epoch, wrapped, created_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT(member_pub, epoch) DO NOTHING`,
+          me.member_pub, epoch, JSON.stringify(data.wrapped_self), new Date().toISOString()
+        );
+      }
+      return { status: 200, body: { ok: true, family: this.familyInfo(), me: this.getMember(me.member_pub) } };
+    }
+    if (verb === "GET" && path === "/family") {
+      return { status: 200, body: { family: this.familyInfo(), me } };
+    }
+    if (verb === "POST" && path === "/join") {
+      return { status: 200, body: { ok: true, status: me.status } };
+    }
+    // Wrapped FCK(s) addressed to the caller.
+    if (verb === "GET" && path === "/keys") {
+      const rows = this.sql
+        .exec(`SELECT epoch, wrapped FROM family_keys WHERE member_pub = ? ORDER BY epoch`, me.member_pub)
+        .toArray()
+        .map((r) => ({ epoch: r.epoch, wrapped: JSON.parse(r.wrapped) }));
+      return { status: 200, body: { rows, current_epoch: this.currentEpoch() } };
+    }
+    if (verb === "LIST" && path === "/members") {
+      const rows = this.sql
+        .exec(`SELECT member_pub, x_pub, role, status, enc_name, name_epoch, joined_at FROM members ORDER BY joined_at`)
+        .toArray()
+        .map((m) => ({ ...m, enc_name: m.enc_name ? JSON.parse(m.enc_name) : null }));
+      return { status: 200, body: { rows } };
+    }
+
+    // ---- admin: admission ----
+    if (verb === "LIST" && path === "/requests") {
+      if (!this.requireAdmin()) return { status: 403, body: { error: "admin_only" } };
+      const rows = this.sql
+        .exec(`SELECT member_pub, x_pub, sealed_name, created_at FROM join_requests ORDER BY created_at`)
+        .toArray()
+        .map((r) => ({ ...r, sealed_name: JSON.parse(r.sealed_name) }));
+      return { status: 200, body: { rows } };
+    }
+    if (verb === "POST" && path === "/admit") {
+      if (!this.requireAdmin()) return { status: 403, body: { error: "admin_only" } };
+      const target = this.getMember(data.member_pub);
+      if (!target) return { status: 404, body: { error: "no_such_member" } };
+      const keys = Array.isArray(data.keys) ? data.keys : [];
+      const now = new Date().toISOString();
+      for (const k of keys) {
+        if (!k || typeof k.epoch !== "number" || !k.wrapped) continue;
+        this.sql.exec(
+          `INSERT INTO family_keys (member_pub, epoch, wrapped, created_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT(member_pub, epoch) DO UPDATE SET wrapped = excluded.wrapped`,
+          data.member_pub, k.epoch, JSON.stringify(k.wrapped), now
+        );
+      }
+      this.sql.exec(
+        `UPDATE members SET status = 'active', enc_name = ?, name_epoch = ? WHERE member_pub = ?`,
+        data.enc_name ? JSON.stringify(data.enc_name) : null,
+        typeof data.name_epoch === "number" ? data.name_epoch : this.currentEpoch(),
+        data.member_pub
+      );
+      this.sql.exec(`DELETE FROM join_requests WHERE member_pub = ?`, data.member_pub);
+      return { status: 200, body: { ok: true } };
+    }
+    if (verb === "POST" && path === "/deny") {
+      if (!this.requireAdmin()) return { status: 403, body: { error: "admin_only" } };
+      const target = this.getMember(data.member_pub);
+      if (target && target.status === "pending") this.sql.exec(`DELETE FROM members WHERE member_pub = ?`, data.member_pub);
+      this.sql.exec(`DELETE FROM join_requests WHERE member_pub = ?`, data.member_pub);
+      return { status: 200, body: { ok: true } };
+    }
+    if (verb === "POST" && path === "/remove") {
+      if (!this.requireAdmin()) return { status: 403, body: { error: "admin_only" } };
+      if (data.member_pub === me.member_pub) return { status: 400, body: { error: "cannot_remove_self" } };
+      const newEpoch = Number(data.new_epoch);
+      if (!Number.isInteger(newEpoch) || newEpoch <= this.currentEpoch()) {
+        return { status: 400, body: { error: "bad_new_epoch" } };
+      }
+      // Drop the removed member and all their wrapped keys.
+      this.sql.exec(`DELETE FROM members WHERE member_pub = ?`, data.member_pub);
+      this.sql.exec(`DELETE FROM family_keys WHERE member_pub = ?`, data.member_pub);
+      this.sql.exec(`DELETE FROM join_requests WHERE member_pub = ?`, data.member_pub);
+      // Install the new epoch key wrapped to each remaining member.
+      const now = new Date().toISOString();
+      const keys = Array.isArray(data.keys) ? data.keys : [];
+      for (const k of keys) {
+        if (!k || !k.member_pub || !k.wrapped) continue;
+        if (!this.getMember(k.member_pub)) continue;
+        this.sql.exec(
+          `INSERT INTO family_keys (member_pub, epoch, wrapped, created_at) VALUES (?, ?, ?, ?)
+           ON CONFLICT(member_pub, epoch) DO UPDATE SET wrapped = excluded.wrapped`,
+          k.member_pub, newEpoch, JSON.stringify(k.wrapped), now
+        );
+      }
+      this.setMeta("current_epoch", String(newEpoch));
+      if (data.enc_family_name) this.setMeta("enc_family_name", JSON.stringify(data.enc_family_name));
+      return { status: 200, body: { ok: true, current_epoch: newEpoch } };
+    }
+
+    // ---- feed ----
+    if (verb === "POST" && path === "/posts") {
+      if (!data.ct || typeof data.epoch !== "number") return { status: 400, body: { error: "missing_ct_or_epoch" } };
+      const id = uid("p");
+      const now = new Date().toISOString();
+      this.sql.exec(
+        `INSERT INTO posts (id, author_pub, epoch, ct, created_at) VALUES (?, ?, ?, ?, ?)`,
+        id, me.member_pub, data.epoch, JSON.stringify(data.ct), now
+      );
+      return { status: 200, body: { id, created_at: now } };
+    }
+    if (verb === "LIST" && path === "/posts") {
+      const limit = Math.min(Number(data.limit) || 50, 100);
+      const rows = this.sql.exec(`SELECT * FROM posts ORDER BY created_at DESC LIMIT ?`, limit).toArray();
+      return { status: 200, body: { rows: rows.map((p) => this.decoratePost(p)) } };
+    }
+    if (verb === "GET" && path.startsWith("/posts/")) {
+      const id = path.slice("/posts/".length);
+      const p = this.sql.exec(`SELECT * FROM posts WHERE id = ?`, id).toArray()[0];
+      if (!p) return { status: 404, body: { error: "not_found" } };
+      const comments = this.sql
+        .exec(`SELECT id, author_pub, epoch, ct, created_at FROM comments WHERE post_id = ? ORDER BY created_at`, id)
+        .toArray()
+        .map((c) => ({ ...c, ct: JSON.parse(c.ct) }));
+      return { status: 200, body: { post: this.decoratePost(p), comments } };
+    }
+    if (verb === "POST" && path.match(/^\/posts\/[^/]+\/comments$/)) {
+      const postId = path.split("/")[2];
+      if (!data.ct || typeof data.epoch !== "number") return { status: 400, body: { error: "missing_ct_or_epoch" } };
+      const id = uid("c");
+      const now = new Date().toISOString();
+      this.sql.exec(
+        `INSERT INTO comments (id, post_id, author_pub, epoch, ct, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+        id, postId, me.member_pub, data.epoch, JSON.stringify(data.ct), now
+      );
+      return { status: 200, body: { id, created_at: now } };
+    }
+    if (verb === "POST" && path.match(/^\/posts\/[^/]+\/react$/)) {
+      const postId = path.split("/")[2];
+      const emoji = String(data.emoji || "\u2764\ufe0f").slice(0, 8);
+      const has = this.sql.exec(`SELECT 1 FROM reactions WHERE post_id=? AND member_pub=? AND emoji=?`, postId, me.member_pub, emoji).toArray()[0];
+      if (has) {
+        this.sql.exec(`DELETE FROM reactions WHERE post_id=? AND member_pub=? AND emoji=?`, postId, me.member_pub, emoji);
+        return { status: 200, body: { reacted: false } };
+      }
+      this.sql.exec(`INSERT INTO reactions (post_id, member_pub, emoji, created_at) VALUES (?, ?, ?, ?)`, postId, me.member_pub, emoji, new Date().toISOString());
+      return { status: 200, body: { reacted: true } };
+    }
+    if (verb === "DELETE" && path.startsWith("/posts/")) {
+      const id = path.slice("/posts/".length);
+      const p = this.sql.exec(`SELECT author_pub FROM posts WHERE id = ?`, id).toArray()[0];
+      if (!p) return { status: 404, body: { error: "not_found" } };
+      if (p.author_pub !== me.member_pub && me.role !== "admin") return { status: 403, body: { error: "not_allowed" } };
+      this.sql.exec(`DELETE FROM posts WHERE id = ?`, id);
+      this.sql.exec(`DELETE FROM comments WHERE post_id = ?`, id);
+      this.sql.exec(`DELETE FROM reactions WHERE post_id = ?`, id);
+      return { status: 200, body: { ok: true } };
+    }
+
+    // ---- events ----
+    if (verb === "POST" && path === "/events") {
+      if (!data.ct || typeof data.epoch !== "number") return { status: 400, body: { error: "missing_ct_or_epoch" } };
+      const id = uid("e");
+      this.sql.exec(
+        `INSERT INTO events (id, created_by, epoch, ct, created_at) VALUES (?, ?, ?, ?, ?)`,
+        id, me.member_pub, data.epoch, JSON.stringify(data.ct), new Date().toISOString()
+      );
+      return { status: 200, body: { id } };
+    }
+    if (verb === "LIST" && path === "/events") {
+      const rows = this.sql.exec(`SELECT * FROM events ORDER BY created_at DESC`).toArray().map((e) => ({
+        id: e.id, created_by: e.created_by, epoch: e.epoch, ct: JSON.parse(e.ct), created_at: e.created_at,
+        rsvps: this.sql.exec(`SELECT member_pub, status FROM rsvps WHERE event_id = ?`, e.id).toArray(),
+      }));
+      return { status: 200, body: { rows } };
+    }
+    if (verb === "POST" && path.match(/^\/events\/[^/]+\/rsvp$/)) {
+      const eventId = path.split("/")[2];
+      const status = ["yes", "no", "maybe"].includes(data.status) ? data.status : "yes";
+      this.sql.exec(
+        `INSERT INTO rsvps (event_id, member_pub, status, updated_at) VALUES (?, ?, ?, ?)
+         ON CONFLICT(event_id, member_pub) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at`,
+        eventId, me.member_pub, status, new Date().toISOString()
+      );
+      return { status: 200, body: { ok: true, status } };
+    }
+    if (verb === "DELETE" && path.startsWith("/events/")) {
+      const id = path.slice("/events/".length);
+      const e = this.sql.exec(`SELECT created_by FROM events WHERE id = ?`, id).toArray()[0];
+      if (!e) return { status: 404, body: { error: "not_found" } };
+      if (e.created_by !== me.member_pub && me.role !== "admin") return { status: 403, body: { error: "not_allowed" } };
+      this.sql.exec(`DELETE FROM events WHERE id = ?`, id);
+      this.sql.exec(`DELETE FROM rsvps WHERE event_id = ?`, id);
+      return { status: 200, body: { ok: true } };
+    }
+
+    // ---- albums / photos ----
+    if (verb === "POST" && path === "/albums") {
+      if (!data.ct || typeof data.epoch !== "number") return { status: 400, body: { error: "missing_ct_or_epoch" } };
+      const id = uid("a");
+      this.sql.exec(
+        `INSERT INTO albums (id, epoch, ct, created_by, created_at) VALUES (?, ?, ?, ?, ?)`,
+        id, data.epoch, JSON.stringify(data.ct), me.member_pub, new Date().toISOString()
+      );
+      return { status: 200, body: { id } };
+    }
+    if (verb === "LIST" && path === "/albums") {
+      const rows = this.sql.exec(`SELECT * FROM albums ORDER BY created_at DESC`).toArray().map((a) => {
+        const cover = this.sql.exec(`SELECT r2_key, epoch FROM photos WHERE album_id = ? ORDER BY created_at DESC LIMIT 1`, a.id).toArray()[0];
+        const n = this.sql.exec(`SELECT COUNT(*) AS n FROM photos WHERE album_id = ?`, a.id).toArray()[0].n;
+        return { id: a.id, epoch: a.epoch, ct: JSON.parse(a.ct), created_at: a.created_at, n, cover: cover?.r2_key || null, cover_epoch: cover?.epoch ?? null };
+      });
+      return { status: 200, body: { rows } };
+    }
+    if (verb === "GET" && path.startsWith("/albums/")) {
+      const albumId = path.slice("/albums/".length);
+      const a = this.sql.exec(`SELECT * FROM albums WHERE id = ?`, albumId).toArray()[0];
+      if (!a) return { status: 404, body: { error: "not_found" } };
+      const photos = this.sql.exec(`SELECT * FROM photos WHERE album_id = ? ORDER BY created_at`, albumId).toArray().map((p) => ({
+        id: p.id, r2_key: p.r2_key, epoch: p.epoch, ct: p.ct ? JSON.parse(p.ct) : null, author_pub: p.author_pub, created_at: p.created_at,
+      }));
+      return { status: 200, body: { album: { id: a.id, epoch: a.epoch, ct: JSON.parse(a.ct), created_at: a.created_at }, photos } };
+    }
+    if (verb === "POST" && path === "/photos") {
+      if (!data.album_id || !data.r2_key || typeof data.epoch !== "number") return { status: 400, body: { error: "missing_fields" } };
+      const id = uid("ph");
+      this.sql.exec(
+        `INSERT INTO photos (id, album_id, r2_key, epoch, ct, author_pub, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        id, data.album_id, data.r2_key, data.epoch, data.ct ? JSON.stringify(data.ct) : null, me.member_pub, new Date().toISOString()
+      );
+      return { status: 200, body: { id } };
+    }
+    // Membership check used by the worker media upload route (active only).
+    if (verb === "POST" && path === "/media/authorize") {
+      if (me.status !== "active") return { status: 403, body: { error: "not_admitted" } };
+      return { status: 200, body: { ok: true, member: me.member_pub } };
+    }
+
+    return { status: 404, body: { error: "route_not_found", path } };
+  }
+
+  familyInfo() {
+    const encName = this.getMeta("enc_family_name");
+    return {
+      enc_family_name: encName ? JSON.parse(encName) : null,
+      current_epoch: this.currentEpoch(),
+      created_at: this.getMeta("created_at"),
+      members: this.sql.exec(`SELECT COUNT(*) AS n FROM members WHERE status = 'active'`).toArray()[0].n,
+      pending: this.sql.exec(`SELECT COUNT(*) AS n FROM join_requests`).toArray()[0].n,
+    };
+  }
+
+  decoratePost(p) {
+    const reactions = this.sql.exec(`SELECT emoji, COUNT(*) AS n FROM reactions WHERE post_id = ? GROUP BY emoji`, p.id).toArray();
+    const mine = this._me
+      ? this.sql.exec(`SELECT emoji FROM reactions WHERE post_id = ? AND member_pub = ?`, p.id, this._me.member_pub).toArray().map((r) => r.emoji)
+      : [];
+    const commentCount = this.sql.exec(`SELECT COUNT(*) AS n FROM comments WHERE post_id = ?`, p.id).toArray()[0].n;
+    return {
+      id: p.id, author_pub: p.author_pub, epoch: p.epoch, ct: JSON.parse(p.ct), created_at: p.created_at,
+      reactions, my_reactions: mine, comment_count: commentCount,
+    };
+  }
+}
+
+// ---- helpers ---------------------------------------------------------------
+
+function uid(prefix) {
+  const b = crypto.getRandomValues(new Uint8Array(12));
+  return `${prefix}_${Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("")}`;
+}
+function jsonResp(status, body, extraHeaders = {}) {
+  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...extraHeaders } });
+}
+function canonicalObj(obj) {
+  const sorted = {};
+  for (const k of Object.keys(obj).sort()) sorted[k] = obj[k];
+  return JSON.stringify(sorted);
+}
+
+const ED_SPKI_PREFIX = new Uint8Array([0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00]);
+function hexToBytesLocal(hex) {
+  if (typeof hex !== "string" || hex.length % 2 !== 0) throw new Error("hex");
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+async function verifyEd25519(pubHex, sigHex, messageStr) {
+  let raw;
+  try {
+    raw = hexToBytesLocal(pubHex);
+  } catch {
+    return false;
+  }
+  if (raw.length !== 32) return false;
+  const der = new Uint8Array(ED_SPKI_PREFIX.length + raw.length);
+  der.set(ED_SPKI_PREFIX, 0);
+  der.set(raw, ED_SPKI_PREFIX.length);
+  let key;
+  try {
+    key = await crypto.subtle.importKey("spki", der, { name: "Ed25519" }, false, ["verify"]);
+  } catch {
+    return false;
+  }
+  let sig;
+  try {
+    sig = hexToBytesLocal(sigHex);
+  } catch {
+    return false;
+  }
+  return crypto.subtle.verify({ name: "Ed25519" }, key, sig, new TextEncoder().encode(messageStr));
+}
