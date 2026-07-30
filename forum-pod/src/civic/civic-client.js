@@ -74,8 +74,18 @@ export const createLobby = ({ name, parentId, visibility = "public_read", joinPo
 
 export const listPosts = (gid) => rpc("LIST", `/groups/${gid}/posts`);
 export const createPost = (gid, text) => rpc("POST", `/groups/${gid}/posts`, { text });
+export const editPost = (gid, pid, text) => rpc("PUT", `/groups/${gid}/posts/${pid}`, { text });
 export const listComments = (gid, pid) => rpc("LIST", `/groups/${gid}/posts/${pid}/comments`);
 export const createComment = (gid, pid, text) => rpc("POST", `/groups/${gid}/posts/${pid}/comments`, { text });
+export const editComment = (gid, pid, cid, text) => rpc("PUT", `/groups/${gid}/posts/${pid}/comments/${cid}`, { text });
 /** Like (+1) / dislike (-1) / clear (0) — this is the agree/disagree signal. */
 export const vote = (gid, itemType, itemId, v) => rpc("POST", `/groups/${gid}/vote`, { item_type: itemType, item_id: itemId, vote: v });
 export const opinionMap = (gid) => rpc("GET", `/groups/${gid}/opinion-map`);
+export const renameGroup = (gid, name) => rpc("PUT", `/groups/${gid}`, { name });
+/** Hide only for narrow illegal categories (see MODERATION in instance.js). */
+export const hideItem = (gid, itemType, itemId, reason) =>
+  rpc("POST", `/groups/${gid}/hide`, { item_type: itemType, item_id: itemId, reason });
+
+// ---- profile -------------------------------------------------------------
+export const myProfile = () => rpc("GET", "/me/profile");
+export const getProfile = (pub) => rpc("GET", `/profiles/${pub}`);

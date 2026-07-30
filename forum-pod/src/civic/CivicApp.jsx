@@ -1,9 +1,10 @@
 import React, { useEffect, useState, useCallback } from "react";
 import { styles as s, t } from "../ui/theme.js";
-import { instance } from "../config/instance.js";
+import { instance, MODERATION } from "../config/instance.js";
 import { bootstrap, foundInstance, registerHandle, listCounties } from "./civic-client.js";
 import { loadCivicProfile, saveCivicProfile, setCivicReady } from "./civic-store.js";
 import GroupView from "./GroupView.jsx";
+import Profile from "./Profile.jsx";
 
 function Onboarding({ mode, onDone }) {
   const [handle, setHandle] = useState("");
@@ -62,7 +63,7 @@ function Onboarding({ mode, onDone }) {
             {busy ? "Working…" : founding ? "Found the forum" : "Join Maine Forum"}
           </button>
           <p style={{ color: t.faint, fontSize: 12, lineHeight: 1.5, margin: 0 }}>
-            No ads · no trackers · member data never sold. County boards and lobbies are public by design.
+            No ads · no trackers · member data never sold. {MODERATION.summary}
           </p>
         </div>
       </div>
@@ -200,13 +201,27 @@ export default function CivicApp() {
         </button>
         <div style={{ flex: 1 }} />
         {profile?.handle && (
-          <div style={{ color: t.dim, fontSize: 13, fontWeight: 500 }}>{profile.handle}</div>
+          <button
+            onClick={() => setStack((st) => [...st, { name: "profile" }])}
+            style={{
+              background: "none", border: "none", color: t.dim, cursor: "pointer",
+              fontSize: 13, fontWeight: 500, fontFamily: "inherit", padding: 0,
+            }}
+          >
+            {profile.handle}
+          </button>
         )}
       </header>
       <main style={{ maxWidth: 720, margin: "0 auto", padding: "20px 16px 48px" }}>
         {view.name === "home" && <CountyBrowser onOpenGroup={openGroup} />}
         {view.name === "group" && (
           <GroupView key={view.group.id} group={view.group} onOpenGroup={openGroup} onBack={goBack} />
+        )}
+        {view.name === "profile" && (
+          <Profile
+            onOpenGroup={(g) => setStack((st) => [...st, { name: "group", group: g }])}
+            onBack={goBack}
+          />
         )}
       </main>
     </div>

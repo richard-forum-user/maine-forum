@@ -150,7 +150,8 @@ export class FamilyDO {
         group_id TEXT NOT NULL,
         author_pub TEXT NOT NULL,
         text TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'visible',        -- 'visible' | 'hidden'
+        status TEXT NOT NULL DEFAULT 'visible',        -- 'visible' | 'hidden' (illegal content only; see MODERATION)
+        edited_at TEXT,
         created_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS group_comments (
@@ -160,6 +161,7 @@ export class FamilyDO {
         author_pub TEXT NOT NULL,
         text TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'visible',
+        edited_at TEXT,
         created_at TEXT NOT NULL
       );
       -- Like/dislike on a post or comment. This IS the Pol.is signal: like = +1
@@ -240,6 +242,8 @@ export class FamilyDO {
       ["members", "handle", "TEXT"], // plaintext pseudonymous handle (public civic layer)
       ["photos", "ct", "TEXT"],
       ["groups", "parent_group_id", "TEXT"], // lobbies nest under a county board
+      ["group_posts", "edited_at", "TEXT"],
+      ["group_comments", "edited_at", "TEXT"],
       // Future columns go here as ["table", "column", "TYPE ...DEFAULT..."].
     ];
     for (const [table, column, type] of additions) {
@@ -1022,13 +1026,29 @@ export class FamilyDO {
       if (g.encryption_mode !== "server") return { status: 400, body: { error: "e2e_group_use_family_posts" } };
       if (!this.canViewGroup(g, me.member_pub)) return { status: 403, body: { error: "not_a_member" } };
       const rows = this.sql.exec(
-        `SELECT id, author_pub, text, created_at FROM group_posts WHERE group_id = ? AND status = 'visible' ORDER BY created_at DESC`, g.id
+        `SELECT id, author_pub, text, created_at, edited_at FROM group_posts WHERE group_id = ? AND status = 'visible' ORDER BY created_at DESC`, g.id
       ).toArray().map((p) => {
         const t = this.voteTally("post", p.id, me.member_pub);
         const nComments = this.sql.exec(`SELECT COUNT(*) AS n FROM group_comments WHERE post_id = ? AND status = 'visible'`, p.id).toArray()[0].n;
         return { ...p, handle: this.handleOf(p.author_pub), ...t, comment_count: nComments };
       });
       return { status: 200, body: { rows } };
+    }
+    // Author edits their own post (discussion topic). Stewards do not rewrite
+    // others' lawful speech — First Amendment–aligned moderation.
+    if (verb === "PUT" && path.match(/^\/groups\/[^/]+\/posts\/[^/]+$/) && !path.includes("/comments")) {
+      const parts = path.split("/");
+      const g = this.getGroup(parts[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (g.encryption_mode !== "server") return { status: 400, body: { error: "e2e_group_use_family_posts" } };
+      const post = this.sql.exec(`SELECT * FROM group_posts WHERE id = ? AND group_id = ?`, parts[4], g.id).toArray()[0];
+      if (!post) return { status: 404, body: { error: "post_not_found" } };
+      if (post.author_pub !== me.member_pub) return { status: 403, body: { error: "author_only" } };
+      const text = String(data.text || "").trim().slice(0, 4000);
+      if (!text) return { status: 400, body: { error: "text_required" } };
+      const now = new Date().toISOString();
+      this.sql.exec(`UPDATE group_posts SET text = ?, edited_at = ? WHERE id = ?`, text, now, post.id);
+      return { status: 200, body: { ok: true, id: post.id, edited_at: now } };
     }
     if (verb === "POST" && path.match(/^\/groups\/[^/]+\/posts\/[^/]+\/comments$/)) {
       const parts = path.split("/");
@@ -1053,9 +1073,23 @@ export class FamilyDO {
       if (!g) return { status: 404, body: { error: "group_not_found" } };
       if (!this.canViewGroup(g, me.member_pub)) return { status: 403, body: { error: "not_a_member" } };
       const rows = this.sql.exec(
-        `SELECT id, author_pub, text, created_at FROM group_comments WHERE post_id = ? AND status = 'visible' ORDER BY created_at`, parts[4]
+        `SELECT id, author_pub, text, created_at, edited_at FROM group_comments WHERE post_id = ? AND status = 'visible' ORDER BY created_at`, parts[4]
       ).toArray().map((c) => ({ ...c, handle: this.handleOf(c.author_pub), ...this.voteTally("comment", c.id, me.member_pub) }));
       return { status: 200, body: { rows } };
+    }
+    if (verb === "PUT" && path.match(/^\/groups\/[^/]+\/posts\/[^/]+\/comments\/[^/]+$/)) {
+      const parts = path.split("/");
+      const g = this.getGroup(parts[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (g.encryption_mode !== "server") return { status: 400, body: { error: "e2e_group_use_family_posts" } };
+      const c = this.sql.exec(`SELECT * FROM group_comments WHERE id = ? AND post_id = ? AND group_id = ?`, parts[6], parts[4], g.id).toArray()[0];
+      if (!c) return { status: 404, body: { error: "comment_not_found" } };
+      if (c.author_pub !== me.member_pub) return { status: 403, body: { error: "author_only" } };
+      const text = String(data.text || "").trim().slice(0, 2000);
+      if (!text) return { status: 400, body: { error: "text_required" } };
+      const now = new Date().toISOString();
+      this.sql.exec(`UPDATE group_comments SET text = ?, edited_at = ? WHERE id = ?`, text, now, c.id);
+      return { status: 200, body: { ok: true, id: c.id, edited_at: now } };
     }
     // Like/dislike a post or comment (the Pol.is agree/disagree signal).
     if (verb === "POST" && path.match(/^\/groups\/[^/]+\/vote$/)) {
@@ -1091,12 +1125,107 @@ export class FamilyDO {
       return { status: 200, body: this.opinionMap(g.id, me.member_pub) };
     }
 
+    // Rename a server-mode group (lobby/county). Steward only — does not touch speech content.
+    if (verb === "PUT" && path.match(/^\/groups\/[^/]+$/) && path.split("/").length === 3) {
+      const g = this.getGroup(path.split("/")[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (g.encryption_mode !== "server") return { status: 400, body: { error: "e2e_group_rename_via_family" } };
+      if (!this.isSteward(g, me.member_pub)) return { status: 403, body: { error: "steward_only" } };
+      const name = String(data.name || "").trim().slice(0, 120);
+      if (!name) return { status: 400, body: { error: "name_required" } };
+      this.sql.exec(`UPDATE groups SET name = ?, slug = ? WHERE id = ?`, name, slugify(name), g.id);
+      return { status: 200, body: { ok: true, group: this.groupInfo(this.getGroup(g.id), me.member_pub) } };
+    }
+
+    // Hide content ONLY for narrow illegal categories (First Amendment–aligned).
+    // Lawful speech — including offensive or unpopular speech — stays up.
+    if (verb === "POST" && path.match(/^\/groups\/[^/]+\/hide$/)) {
+      const g = this.getGroup(path.split("/")[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (g.encryption_mode !== "server") return { status: 400, body: { error: "e2e_group_no_hide" } };
+      if (!this.isModeratorOrAbove(g, me.member_pub)) return { status: 403, body: { error: "moderator_only" } };
+      const reason = String(data.reason || "");
+      const ALLOWED = new Set(["true_threat", "incitement", "csam", "fraud", "court_order"]);
+      if (!ALLOWED.has(reason)) return { status: 400, body: { error: "illegal_category_required", allowed: [...ALLOWED] } };
+      const itemType = data.item_type === "comment" ? "comment" : data.item_type === "post" ? "post" : null;
+      if (!itemType) return { status: 400, body: { error: "bad_item_type" } };
+      const table = itemType === "post" ? "group_posts" : "group_comments";
+      const item = this.sql.exec(`SELECT id FROM ${table} WHERE id = ? AND group_id = ?`, data.item_id, g.id).toArray()[0];
+      if (!item) return { status: 404, body: { error: "item_not_found" } };
+      this.sql.exec(`UPDATE ${table} SET status = 'hidden' WHERE id = ?`, item.id);
+      return { status: 200, body: { ok: true, reason } };
+    }
+
+    // Member profile: handle, groups, posts, comments, and agree/disagree activity.
+    if (verb === "GET" && (path === "/me/profile" || path.startsWith("/profiles/"))) {
+      const target = path === "/me/profile" ? me.member_pub : path.slice("/profiles/".length);
+      if (!target) return { status: 400, body: { error: "missing_member" } };
+      const m = this.getMember(target);
+      if (!m || m.status !== "active") return { status: 404, body: { error: "member_not_found" } };
+      return { status: 200, body: this.memberProfile(target, me.member_pub) };
+    }
+
     return { status: 404, body: { error: "route_not_found", path } };
   }
 
   handleOf(pub) {
     const m = this.getMember(pub);
     return (m && m.handle) || null;
+  }
+
+  /** Public activity profile for a member (server-mode civic layer). */
+  memberProfile(pub, viewerPub) {
+    const m = this.getMember(pub);
+    const groups = this.sql.exec(`SELECT * FROM groups ORDER BY type, created_at`).toArray()
+      .map((g) => {
+        const role = this.groupRole(g, pub);
+        if (!role) return null;
+        // Only list groups the viewer can see.
+        if (!this.canViewGroup(g, viewerPub)) return null;
+        return { ...this.groupInfo(g, viewerPub), my_role: role };
+      })
+      .filter(Boolean);
+
+    const posts = this.sql.exec(
+      `SELECT p.id, p.group_id, p.text, p.created_at, p.edited_at, g.name AS group_name, g.type AS group_type
+       FROM group_posts p JOIN groups g ON g.id = p.group_id
+       WHERE p.author_pub = ? AND p.status = 'visible' ORDER BY p.created_at DESC LIMIT 100`, pub
+    ).toArray().map((p) => ({ ...p, ...this.voteTally("post", p.id, viewerPub) }));
+
+    const comments = this.sql.exec(
+      `SELECT c.id, c.post_id, c.group_id, c.text, c.created_at, c.edited_at, g.name AS group_name, g.type AS group_type
+       FROM group_comments c JOIN groups g ON g.id = c.group_id
+       WHERE c.author_pub = ? AND c.status = 'visible' ORDER BY c.created_at DESC LIMIT 100`, pub
+    ).toArray().map((c) => ({ ...c, ...this.voteTally("comment", c.id, viewerPub) }));
+
+    const votes = this.sql.exec(
+      `SELECT v.item_type, v.item_id, v.vote, v.group_id, v.created_at, g.name AS group_name
+       FROM group_votes v JOIN groups g ON g.id = v.group_id
+       WHERE v.member_pub = ? ORDER BY v.created_at DESC LIMIT 100`, pub
+    ).toArray().map((v) => {
+      const table = v.item_type === "post" ? "group_posts" : "group_comments";
+      const item = this.sql.exec(`SELECT text, status FROM ${table} WHERE id = ?`, v.item_id).toArray()[0];
+      if (!item || item.status !== "visible") return null;
+      return { ...v, text: item.text.slice(0, 140) };
+    }).filter(Boolean);
+
+    return {
+      member_pub: pub,
+      handle: m.handle || null,
+      joined_at: m.joined_at,
+      is_me: pub === viewerPub,
+      groups,
+      posts,
+      comments,
+      votes,
+      counts: {
+        groups: groups.length,
+        posts: posts.length,
+        comments: comments.length,
+        agrees: votes.filter((v) => v.vote > 0).length,
+        disagrees: votes.filter((v) => v.vote < 0).length,
+      },
+    };
   }
 
   /**

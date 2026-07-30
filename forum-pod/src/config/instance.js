@@ -153,6 +153,36 @@ export const OPINION_MAP = {
   likeIsAgree: true, // like = +1 (agree), dislike = -1 (disagree), no vote = pass
 };
 
+/**
+ * Moderation ground rules — First Amendment–aligned.
+ *
+ * This is a private member-owned network, not the government; the First
+ * Amendment does not legally bind us. We nevertheless adopt its protections as
+ * our community standard: **if it is lawful to say, it can be said here.**
+ *
+ * Stewards/moderators may hide content ONLY under the narrow illegal categories
+ * below — never for viewpoint, offense, "misinformation," or disagreement.
+ * Authors may edit or clarify their own posts at any time.
+ */
+export const MODERATION = {
+  standard: "first_amendment_aligned",
+  summary:
+    "Lawful speech is welcome — including unpopular or offensive speech. We do not remove posts for viewpoint.",
+  principles: [
+    "If it is legal to say under U.S. law, it can be said here.",
+    "Authors may edit their own discussion posts and comments.",
+    "Stewards do not rewrite or delete lawful speech for disagreement or offense.",
+    "Hiding is reserved for narrow illegal categories only (true threats, incitement to imminent lawless action, CSAM, fraud, or a binding court order).",
+  ],
+  hideReasons: [
+    { id: "true_threat", label: "True threat" },
+    { id: "incitement", label: "Incitement to imminent lawless action" },
+    { id: "csam", label: "Child sexual abuse material" },
+    { id: "fraud", label: "Fraud / criminal impersonation" },
+    { id: "court_order", label: "Binding court order" },
+  ],
+};
+
 export const VISIBILITIES = {
   private: { id: "private", label: "Private", description: "Only members can find or read this group." },
   members: { id: "members", label: "Members-only", description: "Members read and post; not publicly visible." },
@@ -178,7 +208,8 @@ export const ROLES = {
     id: "moderator",
     label: "Moderator",
     rank: 2,
-    can: ["read", "post", "comment", "react", "rsvp", "vote", "self_log_action", "moderate_content", "review_reports"],
+    // moderate_illegal_only: hide for narrow illegal categories — never viewpoint.
+    can: ["read", "post", "comment", "react", "rsvp", "vote", "self_log_action", "moderate_illegal_only"],
   },
   steward: {
     id: "steward",
@@ -186,7 +217,7 @@ export const ROLES = {
     rank: 3,
     can: [
       "read", "post", "comment", "react", "rsvp", "vote", "self_log_action",
-      "moderate_content", "review_reports", "admit_members", "remove_members",
+      "moderate_illegal_only", "admit_members", "remove_members",
       "manage_group", "open_polls", "record_outcomes", "grant_roles",
     ],
   },

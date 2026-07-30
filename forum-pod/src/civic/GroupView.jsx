@@ -1,11 +1,16 @@
 import React, { useEffect, useState, useCallback } from "react";
 import { styles as s, t, relTime } from "../ui/theme.js";
-import { GROUP_TYPES } from "../config/instance.js";
+import { GROUP_TYPES, MODERATION } from "../config/instance.js";
+import { loadSigningMeta } from "../member-store.js";
 import {
   getGroup, joinGroup, listLobbies, createLobby,
-  listPosts, createPost, listComments, createComment, vote,
+  listPosts, createPost, editPost, listComments, createComment, editComment, vote, hideItem,
 } from "./civic-client.js";
 import OpinionMap from "./OpinionMap.jsx";
+
+function myPub() {
+  return loadSigningMeta()?.publicKeyHex || null;
+}
 
 function VoteBar({ gid, itemType, itemId, likes, dislikes, myVote, onChanged }) {
   const [busy, setBusy] = useState(false);
@@ -38,7 +43,84 @@ function VoteBar({ gid, itemType, itemId, likes, dislikes, myVote, onChanged }) 
   );
 }
 
-function Comments({ gid, postId, canPost }) {
+function HideMenu({ gid, itemType, itemId, canModerate, onDone }) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  if (!canModerate) return null;
+  const run = async (reason) => {
+    setBusy(true);
+    try { await hideItem(gid, itemType, itemId, reason); setOpen(false); await onDone(); }
+    catch (e) { alert(e.message); }
+    finally { setBusy(false); }
+  };
+  return (
+    <div style={{ position: "relative" }}>
+      <button
+        style={{ background: "none", border: "none", color: t.faint, cursor: "pointer", fontSize: 12, fontFamily: "inherit", padding: 0 }}
+        onClick={() => setOpen((o) => !o)}
+      >
+        Hide (illegal only)…
+      </button>
+      {open && (
+        <div style={{ ...s.card, position: "absolute", zIndex: 4, right: 0, top: "100%", marginTop: 4, minWidth: 240, padding: 10, display: "grid", gap: 6 }}>
+          <div style={{ fontSize: 11, color: t.dim, lineHeight: 1.4 }}>{MODERATION.summary}</div>
+          {MODERATION.hideReasons.map((r) => (
+            <button key={r.id} style={{ ...s.btn("ghost"), padding: "6px 10px", fontSize: 12 }} disabled={busy} onClick={() => run(r.id)}>
+              {r.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EditableBody({ text, editedAt, canEdit, onSave }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(text);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => { setDraft(text); }, [text]);
+  const save = async () => {
+    if (!draft.trim()) return;
+    setBusy(true);
+    try { await onSave(draft.trim()); setEditing(false); }
+    finally { setBusy(false); }
+  };
+  if (editing) {
+    return (
+      <div style={{ display: "grid", gap: 8 }}>
+        <textarea
+          style={{ ...s.input, minHeight: 72, resize: "vertical", fontFamily: "inherit" }}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          autoFocus
+        />
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button style={s.btn("ghost")} disabled={busy} onClick={() => { setEditing(false); setDraft(text); }}>Cancel</button>
+          <button style={s.btn("primary")} disabled={busy || !draft.trim()} onClick={save}>{busy ? "Saving…" : "Save"}</button>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div>
+      <div style={{ fontSize: 16, whiteSpace: "pre-wrap", lineHeight: 1.45 }}>{text}</div>
+      <div style={{ display: "flex", gap: 12, marginTop: 6, alignItems: "center" }}>
+        {editedAt && <span style={{ fontSize: 11, color: t.faint }}>edited</span>}
+        {canEdit && (
+          <button
+            style={{ background: "none", border: "none", color: t.accent, cursor: "pointer", fontSize: 12, fontFamily: "inherit", padding: 0 }}
+            onClick={() => setEditing(true)}
+          >
+            Edit
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Comments({ gid, postId, canPost, canModerate, me }) {
   const [rows, setRows] = useState(null);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
@@ -57,9 +139,17 @@ function Comments({ gid, postId, canPost }) {
           rows.map((c) => (
             <div key={c.id}>
               <div style={{ fontSize: 12, color: t.faint }}>{c.handle || "member"} · {relTime(c.created_at)}</div>
-              <div style={{ fontSize: 14, marginTop: 2 }}>{c.text}</div>
-              <div style={{ marginTop: 6 }}>
+              <div style={{ marginTop: 2, fontSize: 14 }}>
+                <EditableBody
+                  text={c.text}
+                  editedAt={c.edited_at}
+                  canEdit={me && c.author_pub === me}
+                  onSave={async (next) => { await editComment(gid, postId, c.id, next); await load(); }}
+                />
+              </div>
+              <div style={{ marginTop: 6, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
                 <VoteBar gid={gid} itemType="comment" itemId={c.id} likes={c.likes} dislikes={c.dislikes} myVote={c.my_vote} onChanged={load} />
+                <HideMenu gid={gid} itemType="comment" itemId={c.id} canModerate={canModerate} onDone={load} />
               </div>
             </div>
           ))}
@@ -79,6 +169,8 @@ function Feed({ group }) {
   const [busy, setBusy] = useState(false);
   const [openComments, setOpenComments] = useState({});
   const canPost = !!group.my_role;
+  const canModerate = group.my_role === "steward" || group.my_role === "moderator";
+  const me = myPub();
 
   const load = useCallback(async () => { setRows((await listPosts(group.id)).rows); }, [group.id]);
   useEffect(() => { load(); }, [load]);
@@ -115,8 +207,13 @@ function Feed({ group }) {
           rows.map((p) => (
             <article key={p.id} style={s.card} className="mf-fade-in">
               <div style={{ fontSize: 12, color: t.faint, marginBottom: 6 }}>{p.handle || "member"} · {relTime(p.created_at)}</div>
-              <div style={{ fontSize: 16, whiteSpace: "pre-wrap", marginBottom: 12, lineHeight: 1.45 }}>{p.text}</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+              <EditableBody
+                text={p.text}
+                editedAt={p.edited_at}
+                canEdit={me && p.author_pub === me}
+                onSave={async (next) => { await editPost(group.id, p.id, next); await load(); }}
+              />
+              <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", marginTop: 10 }}>
                 <VoteBar gid={group.id} itemType="post" itemId={p.id} likes={p.likes} dislikes={p.dislikes} myVote={p.my_vote} onChanged={load} />
                 <button
                   style={{ background: "none", border: "none", color: t.dim, cursor: "pointer", fontSize: 13, fontFamily: "inherit", padding: 0 }}
@@ -125,8 +222,11 @@ function Feed({ group }) {
                   {p.comment_count} {p.comment_count === 1 ? "reply" : "replies"}
                   {openComments[p.id] ? " · hide" : ""}
                 </button>
+                <HideMenu gid={group.id} itemType="post" itemId={p.id} canModerate={canModerate} onDone={load} />
               </div>
-              {openComments[p.id] && <Comments gid={group.id} postId={p.id} canPost={canPost} />}
+              {openComments[p.id] && (
+                <Comments gid={group.id} postId={p.id} canPost={canPost} canModerate={canModerate} me={me} />
+              )}
             </article>
           ))}
     </div>
@@ -221,6 +321,7 @@ export default function GroupView({ group: initial, onOpenGroup, onBack }) {
   useEffect(() => {
     setGroup(initial);
     setTab(initial.type === "county" ? "lobbies" : "discussion");
+    getGroup(initial.id).then((r) => setGroup(r.group)).catch(() => {});
   }, [initial]);
 
   const refreshGroup = useCallback(async () => {
