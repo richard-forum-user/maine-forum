@@ -14,14 +14,26 @@ function VoteBar({ gid, itemType, itemId, likes, dislikes, myVote, onChanged }) 
     try { await vote(gid, itemType, itemId, myVote === v ? 0 : v); await onChanged(); }
     finally { setBusy(false); }
   };
-  const btn = (active, color) => ({
-    ...s.btn("ghost"), padding: "4px 10px", fontSize: 13,
-    borderColor: active ? color : t.border, color: active ? color : t.dim,
-  });
   return (
     <div style={{ display: "flex", gap: 8 }}>
-      <button style={btn(myVote === 1, t.good)} disabled={busy} onClick={() => cast(1)}>{"\uD83D\uDC4D"} {likes}</button>
-      <button style={btn(myVote === -1, t.bad)} disabled={busy} onClick={() => cast(-1)}>{"\uD83D\uDC4E"} {dislikes}</button>
+      <button
+        className={`mf-vote mf-vote--up${myVote === 1 ? " mf-vote--on" : ""}`}
+        disabled={busy}
+        onClick={() => cast(1)}
+        aria-pressed={myVote === 1}
+        aria-label="Agree"
+      >
+        Agree · {likes}
+      </button>
+      <button
+        className={`mf-vote mf-vote--down${myVote === -1 ? " mf-vote--on" : ""}`}
+        disabled={busy}
+        onClick={() => cast(-1)}
+        aria-pressed={myVote === -1}
+        aria-label="Disagree"
+      >
+        Disagree · {dislikes}
+      </button>
     </div>
   );
 }
@@ -39,14 +51,14 @@ function Comments({ gid, postId, canPost }) {
     finally { setBusy(false); }
   };
   return (
-    <div style={{ marginTop: 10, paddingLeft: 12, borderLeft: `2px solid ${t.border}`, display: "grid", gap: 8 }}>
-      {rows == null ? <div style={{ color: t.faint, fontSize: 12 }}>Loading…</div> :
-        rows.length === 0 ? <div style={{ color: t.faint, fontSize: 12 }}>No replies yet.</div> :
+    <div style={{ marginTop: 12, paddingLeft: 14, borderLeft: `2px solid ${t.border}`, display: "grid", gap: 10 }}>
+      {rows == null ? <div style={{ color: t.faint, fontSize: 13 }}>Loading…</div> :
+        rows.length === 0 ? <div style={{ color: t.faint, fontSize: 13 }}>No replies yet.</div> :
           rows.map((c) => (
             <div key={c.id}>
-              <div style={{ fontSize: 12, color: t.dim }}>{c.handle || "member"} · {relTime(c.created_at)}</div>
-              <div style={{ fontSize: 13 }}>{c.text}</div>
-              <div style={{ marginTop: 4 }}>
+              <div style={{ fontSize: 12, color: t.faint }}>{c.handle || "member"} · {relTime(c.created_at)}</div>
+              <div style={{ fontSize: 14, marginTop: 2 }}>{c.text}</div>
+              <div style={{ marginTop: 6 }}>
                 <VoteBar gid={gid} itemType="comment" itemId={c.id} likes={c.likes} dislikes={c.dislikes} myVote={c.my_vote} onChanged={load} />
               </div>
             </div>
@@ -83,33 +95,39 @@ function Feed({ group }) {
       {canPost ? (
         <div style={{ ...s.card, display: "grid", gap: 10 }}>
           <textarea
-            style={{ ...s.input, minHeight: 72, resize: "vertical", fontFamily: "inherit" }}
-            placeholder="Share a position or proposal. Others will agree or disagree — that shapes the opinion map."
-            value={text} onChange={(e) => setText(e.target.value)}
+            style={{ ...s.input, minHeight: 88, resize: "vertical", fontFamily: "inherit" }}
+            placeholder="Share a position. Others will agree or disagree — that shapes the opinion map."
+            value={text}
+            onChange={(e) => setText(e.target.value)}
           />
           <div style={{ display: "flex", justifyContent: "flex-end" }}>
-            <button style={s.btn("primary")} disabled={busy || !text.trim()} onClick={submit}>{busy ? "Posting…" : "Post"}</button>
+            <button style={s.btn("primary")} disabled={busy || !text.trim()} onClick={submit}>
+              {busy ? "Posting…" : "Post"}
+            </button>
           </div>
         </div>
       ) : (
-        <div style={{ ...s.card, color: t.dim, fontSize: 13 }}>Join this group to post and vote.</div>
+        <div style={{ ...s.card, color: t.dim, fontSize: 14 }}>Join this group to post and vote.</div>
       )}
 
       {rows == null ? <div style={{ color: t.dim }}>Loading…</div> :
         rows.length === 0 ? <div style={{ ...s.card, color: t.faint }}>No posts yet. Start the conversation.</div> :
           rows.map((p) => (
-            <div key={p.id} style={s.card}>
-              <div style={{ fontSize: 12, color: t.dim, marginBottom: 6 }}>{p.handle || "member"} · {relTime(p.created_at)}</div>
-              <div style={{ fontSize: 15, whiteSpace: "pre-wrap", marginBottom: 10 }}>{p.text}</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+            <article key={p.id} style={s.card} className="mf-fade-in">
+              <div style={{ fontSize: 12, color: t.faint, marginBottom: 6 }}>{p.handle || "member"} · {relTime(p.created_at)}</div>
+              <div style={{ fontSize: 16, whiteSpace: "pre-wrap", marginBottom: 12, lineHeight: 1.45 }}>{p.text}</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
                 <VoteBar gid={group.id} itemType="post" itemId={p.id} likes={p.likes} dislikes={p.dislikes} myVote={p.my_vote} onChanged={load} />
-                <button style={{ background: "none", border: "none", color: t.dim, cursor: "pointer", fontSize: 13 }}
-                  onClick={() => setOpenComments((o) => ({ ...o, [p.id]: !o[p.id] }))}>
-                  {"\uD83D\uDCAC"} {p.comment_count}{openComments[p.id] ? " · hide" : ""}
+                <button
+                  style={{ background: "none", border: "none", color: t.dim, cursor: "pointer", fontSize: 13, fontFamily: "inherit", padding: 0 }}
+                  onClick={() => setOpenComments((o) => ({ ...o, [p.id]: !o[p.id] }))}
+                >
+                  {p.comment_count} {p.comment_count === 1 ? "reply" : "replies"}
+                  {openComments[p.id] ? " · hide" : ""}
                 </button>
               </div>
               {openComments[p.id] && <Comments gid={group.id} postId={p.id} canPost={canPost} />}
-            </div>
+            </article>
           ))}
     </div>
   );
@@ -120,7 +138,7 @@ function Lobbies({ county, onOpenGroup }) {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-  const canCreate = !!county.my_role; // must be a member of the county board
+  const canCreate = !!county.my_role;
 
   const load = useCallback(async () => { setRows((await listLobbies(county.id)).rows); }, [county.id]);
   useEffect(() => { load(); }, [load]);
@@ -128,36 +146,66 @@ function Lobbies({ county, onOpenGroup }) {
   const create = async () => {
     if (!name.trim()) return;
     setBusy(true); setErr("");
-    try { const r = await createLobby({ name: name.trim(), parentId: county.id }); setName(""); await load(); onOpenGroup(r.group); }
-    catch (e) { setErr(e.message); }
+    try {
+      const r = await createLobby({ name: name.trim(), parentId: county.id });
+      setName("");
+      await load();
+      onOpenGroup(r.group);
+    } catch (e) { setErr(e.message); }
     finally { setBusy(false); }
   };
 
   return (
     <div style={{ display: "grid", gap: 12 }}>
       <div style={{ ...s.card, display: "grid", gap: 10 }}>
-        <div style={{ fontWeight: 700 }}>Start a lobby</div>
-        <div style={{ color: t.dim, fontSize: 13 }}>A civilian lobby for a specific issue in {county.name}. Anyone can deliberate; positions and tallies are public.</div>
+        <div style={{ fontFamily: t.display, fontWeight: 700, fontSize: 17 }}>Start a lobby</div>
+        <div style={{ color: t.dim, fontSize: 14 }}>
+          A civilian lobby for a specific issue in {county.name}. Deliberate, find common ground, then act.
+        </div>
         {canCreate ? (
           <>
-            <div style={{ display: "flex", gap: 8 }}>
-              <input style={{ ...s.input, flex: 1 }} placeholder="e.g. Ranked-choice voting" value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && create()} />
-              <button style={s.btn("primary")} disabled={busy || !name.trim()} onClick={create}>{busy ? "Creating…" : "Create"}</button>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <input
+                style={{ ...s.input, flex: 1, minWidth: 180 }}
+                placeholder="e.g. Ranked-choice voting"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && create()}
+              />
+              <button style={s.btn("primary")} disabled={busy || !name.trim()} onClick={create}>
+                {busy ? "Creating…" : "Create"}
+              </button>
             </div>
             {err && <div style={{ color: t.bad, fontSize: 13 }}>{err}</div>}
           </>
-        ) : <div style={{ color: t.faint, fontSize: 13 }}>Join this county board to start a lobby.</div>}
+        ) : (
+          <div style={{ color: t.faint, fontSize: 13 }}>Join this county board to start a lobby.</div>
+        )}
       </div>
 
       {rows == null ? <div style={{ color: t.dim }}>Loading…</div> :
         rows.length === 0 ? <div style={{ ...s.card, color: t.faint }}>No lobbies yet in {county.name}.</div> :
           rows.map((g) => (
-            <button key={g.id} onClick={() => onOpenGroup(g)} style={{ ...s.card, textAlign: "left", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <button
+              key={g.id}
+              onClick={() => onOpenGroup(g)}
+              style={{
+                ...s.card,
+                textAlign: "left",
+                cursor: "pointer",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                width: "100%",
+                fontFamily: "inherit",
+                color: "inherit",
+              }}
+            >
               <div>
-                <div style={{ fontWeight: 700 }}>{g.name}</div>
-                <div style={{ color: t.dim, fontSize: 12 }}>{g.member_count} members</div>
+                <div style={{ fontFamily: t.display, fontWeight: 700 }}>{g.name}</div>
+                <div style={{ color: t.faint, fontSize: 12, marginTop: 2 }}>{g.member_count} members</div>
               </div>
-              <span style={{ color: t.accent }}>{"\u2192"}</span>
+              <span style={{ color: t.accent, fontSize: 18 }} aria-hidden>→</span>
             </button>
           ))}
     </div>
@@ -170,9 +218,14 @@ export default function GroupView({ group: initial, onOpenGroup, onBack }) {
   const [tab, setTab] = useState(isCounty ? "lobbies" : "discussion");
   const [joining, setJoining] = useState(false);
 
-  useEffect(() => { setGroup(initial); setTab(initial.type === "county" ? "lobbies" : "discussion"); }, [initial]);
+  useEffect(() => {
+    setGroup(initial);
+    setTab(initial.type === "county" ? "lobbies" : "discussion");
+  }, [initial]);
 
-  const refreshGroup = useCallback(async () => { setGroup((await getGroup(group.id)).group); }, [group.id]);
+  const refreshGroup = useCallback(async () => {
+    setGroup((await getGroup(group.id)).group);
+  }, [group.id]);
 
   const join = async () => {
     setJoining(true);
@@ -186,26 +239,38 @@ export default function GroupView({ group: initial, onOpenGroup, onBack }) {
     : [["discussion", "Discussion"], ["map", "Opinion map"]];
 
   return (
-    <div style={{ display: "grid", gap: 16 }}>
+    <div className="mf-fade-in" style={{ display: "grid", gap: 16 }}>
       <div>
-        <button onClick={onBack} style={{ background: "none", border: "none", color: t.accent, cursor: "pointer", fontSize: 13, padding: 0 }}>{"\u2190"} Back</button>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6 }}>
-          <h2 style={{ margin: 0, fontSize: 22 }}>{group.name}</h2>
+        <button
+          onClick={onBack}
+          style={{ background: "none", border: "none", color: t.accent, cursor: "pointer", fontSize: 13, padding: 0, fontFamily: "inherit" }}
+        >
+          ← Back
+        </button>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8, flexWrap: "wrap" }}>
+          <h2 className="mf-brand" style={{ margin: 0, fontSize: "clamp(1.4rem, 4vw, 1.85rem)" }}>{group.name}</h2>
           <span style={s.pill(t.accent)}>{label}</span>
         </div>
-        <div style={{ color: t.dim, fontSize: 13, marginTop: 4 }}>
-          {group.member_count} members · {group.visibility === "public_read" ? "public" : group.visibility}
-          {!group.my_role && <> · <button onClick={join} disabled={joining} style={{ ...s.btn("primary"), padding: "2px 12px", fontSize: 13 }}>{joining ? "Joining…" : "Join"}</button></>}
-          {group.my_role && <> · <span style={s.pill(t.good)}>{group.my_role}</span></>}
+        <div style={{ color: t.dim, fontSize: 13, marginTop: 6, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span>{group.member_count} members · {group.visibility === "public_read" ? "public" : group.visibility}</span>
+          {!group.my_role && (
+            <button onClick={join} disabled={joining} style={{ ...s.btn("primary"), padding: "6px 14px", fontSize: 13 }}>
+              {joining ? "Joining…" : "Join"}
+            </button>
+          )}
+          {group.my_role && <span style={s.pill(t.good)}>{group.my_role}</span>}
         </div>
       </div>
 
-      <div style={{ display: "flex", gap: 8, borderBottom: `1px solid ${t.border}` }}>
+      <div style={{ display: "flex", gap: 14, borderBottom: `1px solid ${t.border}` }}>
         {TABS.map(([id, lbl]) => (
-          <button key={id} onClick={() => setTab(id)} style={{
-            background: "none", border: "none", cursor: "pointer", padding: "8px 4px", fontSize: 14, fontWeight: 600,
-            color: tab === id ? t.text : t.dim, borderBottom: `2px solid ${tab === id ? t.accent : "transparent"}`,
-          }}>{lbl}</button>
+          <button
+            key={id}
+            className={`mf-tab${tab === id ? " mf-tab--active" : ""}`}
+            onClick={() => setTab(id)}
+          >
+            {lbl}
+          </button>
         ))}
       </div>
 

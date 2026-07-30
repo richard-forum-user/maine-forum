@@ -2,18 +2,8 @@ import React, { useEffect, useState, useCallback } from "react";
 import { styles as s, t } from "../ui/theme.js";
 import { instance } from "../config/instance.js";
 import { bootstrap, foundInstance, registerHandle, listCounties } from "./civic-client.js";
-import { civicReady, setCivicReady, loadCivicProfile, saveCivicProfile } from "./civic-store.js";
+import { loadCivicProfile, saveCivicProfile, setCivicReady } from "./civic-store.js";
 import GroupView from "./GroupView.jsx";
-
-function Shell({ children, center }) {
-  return (
-    <div style={{ ...s.app, paddingBottom: 40 }}>
-      <div style={center ? { display: "flex", justifyContent: "center", padding: "48px 16px" } : { maxWidth: 680, margin: "0 auto", padding: "16px" }}>
-        {children}
-      </div>
-    </div>
-  );
-}
 
 function Onboarding({ mode, onDone }) {
   const [handle, setHandle] = useState("");
@@ -37,58 +27,102 @@ function Onboarding({ mode, onDone }) {
   };
 
   return (
-    <Shell center>
-      <div style={{ width: "100%", maxWidth: 440 }}>
-        <div style={{ textAlign: "center", marginBottom: 24 }}>
-          <div style={{ fontSize: 30, fontWeight: 800, letterSpacing: -0.5 }}>{instance.name}</div>
-          <div style={{ color: t.dim, marginTop: 6, fontSize: 14 }}>{instance.tagline}</div>
-        </div>
-        <div style={{ ...s.card, display: "grid", gap: 14 }}>
-          <div style={{ fontWeight: 700, fontSize: 16 }}>{founding ? "Set up the forum" : "Join the forum"}</div>
-          <div style={{ color: t.dim, fontSize: 13 }}>
-            {founding
-              ? "You're the first here. Choose a handle to found the forum and open it for public signup."
-              : "Choose a public handle. No real name, no email, no ID — your handle is how others see you."}
-          </div>
+    <div className="mf-hero">
+      <div className="mf-hero__inner">
+        <p className="mf-brand mf-fade-up" style={{ fontSize: "clamp(2.4rem, 8vw, 3.4rem)", marginBottom: 10 }}>
+          {instance.name}
+        </p>
+        <p className="mf-fade-up mf-delay-1" style={{ color: t.dim, fontSize: 17, margin: "0 0 28px", maxWidth: 36 * 16 }}>
+          {instance.tagline}
+        </p>
+
+        <div className="mf-fade-up mf-delay-2" style={{ display: "grid", gap: 14 }}>
           <div>
-            <label style={s.label}>Handle</label>
-            <input style={s.input} value={handle} placeholder="e.g. PortlandVoter" onChange={(e) => setHandle(e.target.value)} onKeyDown={(e) => e.key === "Enter" && go()} />
+            <label style={s.label} htmlFor="mf-handle">
+              {founding ? "Your founding handle" : "Choose a public handle"}
+            </label>
+            <input
+              id="mf-handle"
+              style={s.input}
+              value={handle}
+              autoFocus
+              autoComplete="username"
+              placeholder="e.g. PortlandVoter"
+              onChange={(e) => setHandle(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && go()}
+            />
+            <div style={{ color: t.faint, fontSize: 13, marginTop: 8, lineHeight: 1.45 }}>
+              {founding
+                ? "You're first. This opens public signup and seeds Maine's 16 county boards."
+                : "No real name, email, or ID. Your handle is how others see you."}
+            </div>
           </div>
-          {err && <div style={{ color: t.bad, fontSize: 13 }}>{err}</div>}
-          <button style={s.btn("primary")} disabled={busy} onClick={go}>
-            {busy ? "Working…" : founding ? "Found the forum" : "Create my handle"}
+          {err && <div style={{ color: t.bad, fontSize: 14 }}>{err}</div>}
+          <button style={s.btn("primary", busy)} disabled={busy} onClick={go}>
+            {busy ? "Working…" : founding ? "Found the forum" : "Join Maine Forum"}
           </button>
-          <div style={{ color: t.faint, fontSize: 11, lineHeight: 1.5 }}>
-            No ads, no trackers, no data sales. Community groups are end-to-end encrypted;
-            county boards and lobbies are public by design.
-          </div>
+          <p style={{ color: t.faint, fontSize: 12, lineHeight: 1.5, margin: 0 }}>
+            No ads · no trackers · member data never sold. County boards and lobbies are public by design.
+          </p>
         </div>
       </div>
-    </Shell>
+    </div>
   );
 }
 
 function CountyBrowser({ onOpenGroup }) {
   const [rows, setRows] = useState(null);
   const [err, setErr] = useState("");
+  const [q, setQ] = useState("");
+
   useEffect(() => {
     listCounties().then((r) => setRows(r.rows)).catch((e) => setErr(e.message));
   }, []);
+
+  const filtered = (rows || []).filter((g) =>
+    !q.trim() || g.name.toLowerCase().includes(q.trim().toLowerCase())
+  );
+
   return (
-    <div style={{ display: "grid", gap: 14 }}>
+    <div className="mf-fade-in" style={{ display: "grid", gap: 18 }}>
       <div>
-        <h2 style={{ margin: "0 0 2px", fontSize: 20 }}>County boards</h2>
-        <div style={{ color: t.dim, fontSize: 13 }}>Pick your county to join the discussion and start or join lobbies.</div>
+        <h1 className="mf-brand" style={{ margin: "0 0 6px", fontSize: "clamp(1.6rem, 4vw, 2rem)" }}>
+          County boards
+        </h1>
+        <p style={{ color: t.dim, fontSize: 15, margin: 0 }}>
+          Pick your county to join the discussion and start or join lobbies.
+        </p>
       </div>
+
+      <input
+        style={s.input}
+        value={q}
+        placeholder="Filter counties…"
+        aria-label="Filter counties"
+        onChange={(e) => setQ(e.target.value)}
+      />
+
       {err && <div style={{ ...s.card, color: t.bad }}>{err}</div>}
-      {rows == null ? <div style={{ color: t.dim }}>Loading…</div> : (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 10 }}>
-          {rows.map((g) => (
-            <button key={g.id} onClick={() => onOpenGroup(g)} style={{ ...s.card, padding: 14, textAlign: "left", cursor: "pointer" }}>
-              <div style={{ fontWeight: 700 }}>{g.name}</div>
-              <div style={{ color: t.dim, fontSize: 12, marginTop: 2 }}>{g.member_count} members</div>
+      {rows == null ? (
+        <div style={{ color: t.dim }}>Loading counties…</div>
+      ) : (
+        <div className="mf-county-grid">
+          {filtered.map((g, i) => (
+            <button
+              key={g.id}
+              className="mf-county-tile mf-fade-up"
+              style={{ animationDelay: `${Math.min(i, 12) * 0.03}s` }}
+              onClick={() => onOpenGroup(g)}
+            >
+              <div style={{ fontFamily: t.display, fontWeight: 700, fontSize: 16 }}>{g.name}</div>
+              <div style={{ color: t.faint, fontSize: 12, marginTop: 4 }}>
+                {g.member_count} {g.member_count === 1 ? "member" : "members"}
+              </div>
             </button>
           ))}
+          {filtered.length === 0 && (
+            <div style={{ color: t.faint, gridColumn: "1 / -1" }}>No counties match “{q}”.</div>
+          )}
         </div>
       )}
     </div>
@@ -96,7 +130,7 @@ function CountyBrowser({ onOpenGroup }) {
 }
 
 export default function CivicApp() {
-  const [phase, setPhase] = useState("loading"); // loading | found | signup | app
+  const [phase, setPhase] = useState("loading");
   const [stack, setStack] = useState([{ name: "home" }]);
   const [err, setErr] = useState("");
   const profile = loadCivicProfile();
@@ -120,21 +154,56 @@ export default function CivicApp() {
   useEffect(() => { init(); }, [init]);
 
   if (phase === "loading") {
-    return <Shell center><div style={{ color: t.dim }}>{err ? <span style={{ color: t.bad }}>{err}</span> : `Loading ${instance.name}…`}</div></Shell>;
+    return (
+      <div className="mf-hero">
+        <div className="mf-hero__inner mf-fade-in" style={{ textAlign: "center" }}>
+          <div className="mf-brand" style={{ fontSize: 28, marginBottom: 8 }}>{instance.name}</div>
+          <div style={{ color: err ? t.bad : t.dim }}>{err || "Loading…"}</div>
+        </div>
+      </div>
+    );
   }
   if (phase === "found") return <Onboarding mode="found" onDone={init} />;
   if (phase === "signup") return <Onboarding mode="signup" onDone={init} />;
 
   return (
     <div style={s.app}>
-      <header style={{ position: "sticky", top: 0, zIndex: 5, background: t.panel, borderBottom: `1px solid ${t.border}`, padding: "12px 16px", display: "flex", alignItems: "center", gap: 12 }}>
-        <button onClick={goHome} style={{ background: "none", border: "none", color: t.text, cursor: "pointer", fontWeight: 800, fontSize: 17, padding: 0 }}>
+      <header
+        style={{
+          position: "sticky",
+          top: 0,
+          zIndex: 5,
+          backdropFilter: "blur(12px)",
+          background: "color-mix(in srgb, var(--forum-bg-elevated) 88%, transparent)",
+          borderBottom: `1px solid ${t.border}`,
+          padding: "12px 16px",
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+        }}
+      >
+        <button
+          onClick={goHome}
+          style={{
+            background: "none",
+            border: "none",
+            color: t.text,
+            cursor: "pointer",
+            fontFamily: t.display,
+            fontWeight: 800,
+            fontSize: 18,
+            letterSpacing: "-0.03em",
+            padding: 0,
+          }}
+        >
           {instance.shortName || instance.name}
         </button>
         <div style={{ flex: 1 }} />
-        {profile?.handle && <div style={{ color: t.dim, fontSize: 13 }}>{profile.handle}</div>}
+        {profile?.handle && (
+          <div style={{ color: t.dim, fontSize: 13, fontWeight: 500 }}>{profile.handle}</div>
+        )}
       </header>
-      <main style={{ maxWidth: 680, margin: "0 auto", padding: "16px" }}>
+      <main style={{ maxWidth: 720, margin: "0 auto", padding: "20px 16px 48px" }}>
         {view.name === "home" && <CountyBrowser onOpenGroup={openGroup} />}
         {view.name === "group" && (
           <GroupView key={view.group.id} group={view.group} onOpenGroup={openGroup} onBack={goBack} />

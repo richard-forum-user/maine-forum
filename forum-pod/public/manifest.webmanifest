@@ -1,12 +1,12 @@
 {
-  "name": "Family",
-  "short_name": "Family",
-  "description": "A private, self-hosted space for your family: shared feed, photos and calendar.",
+  "name": "Maine Forum",
+  "short_name": "Forum",
+  "description": "A member-owned network for Maine political discourse.",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",
-  "background_color": "#0b0f14",
-  "theme_color": "#0b0f14",
+  "background_color": "#e8eef2",
+  "theme_color": "#1f6b56",
   "icons": [
     {
       "src": "app-icon.svg",

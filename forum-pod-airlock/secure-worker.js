@@ -31,7 +31,7 @@ const CORS = {
 
 const SECURITY_HEADERS = {
   'Content-Security-Policy':
-    "default-src 'self'; script-src 'self' blob: https://cdn.jsdelivr.net 'wasm-unsafe-eval'; script-src-elem 'self' https://cdn.jsdelivr.net; worker-src 'self' blob:; child-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https: blob:; frame-ancestors 'none'; base-uri 'none'",
+    "default-src 'self'; script-src 'self' blob: https://cdn.jsdelivr.net 'wasm-unsafe-eval'; script-src-elem 'self' https://cdn.jsdelivr.net; worker-src 'self' blob:; child-src 'self' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data:; connect-src 'self' https: blob:; frame-ancestors 'none'; base-uri 'none'",
   'X-Frame-Options': 'DENY',
   'Referrer-Policy': 'strict-origin-when-cross-origin',
   'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
@@ -333,12 +333,16 @@ export default {
       return forwardPodRpc(request, env, bodyText, bundle);
     }
 
-    // Any non-API GET maps to the static asset bundle. Unmatched paths
+    // Any non-API GET/HEAD maps to the static asset bundle. Unmatched paths
     // fall through to the SPA shell so deep-links / PWA refreshes don't
     // return raw `route_not_found` JSON to the user.
-    if (request.method === 'GET') {
+    if (request.method === 'GET' || request.method === 'HEAD') {
       try {
         const assetUrl = new URL(request.url);
+        // Canonical app path is /pod/ (Vite base). Send bare `/` there.
+        if (assetUrl.pathname === '/' || assetUrl.pathname === '') {
+          return Response.redirect(new URL('/pod/', assetUrl).toString(), 302);
+        }
         if (assetUrl.pathname === '/pod' || assetUrl.pathname === '/pod/') {
           assetUrl.pathname = '/';
         } else if (assetUrl.pathname.startsWith('/pod/')) {

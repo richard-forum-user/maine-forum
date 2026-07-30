@@ -1,4 +1,4 @@
-const CACHE_NAME = "podlink-v5-invite-guard";
+const CACHE_NAME = "maine-forum-v1";
 const APP_SHELL = [
   "./",
   "./manifest.webmanifest",

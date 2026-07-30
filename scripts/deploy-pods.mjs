@@ -26,6 +26,12 @@ const DOMAINS = {
   family: "family.yourcommunity.forum",
 };
 
+// Hostnames that already have DNS in the zone (cannot use custom_domain until
+// those records are deleted). Bind via a Workers route instead.
+const ZONE_ROUTES = {
+  maine: { pattern: "maine.yourcommunity.forum/*", zone_name: "yourcommunity.forum", host: "maine.yourcommunity.forum" },
+};
+
 function exec(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { cwd: WORKER, env: process.env });
@@ -57,18 +63,24 @@ async function ensureD1(dbName) {
   return id;
 }
 
-function patch({ name, dbId, publicUrl, domain }) {
+function patch({ name, dbId, dbName, publicUrl, domain, zoneRoute }) {
   // Always start from the pristine template so custom-domain blocks and
   // origin lists don't accumulate across the two-phase deploy.
   let toml = template;
   toml = toml.replace(/^name\s*=\s*".*"/m, `name = "${name}"`);
+  if (dbName) toml = toml.replace(/database_name\s*=\s*"[^"]*"/g, `database_name = "${dbName}"`);
   toml = toml.replace(/database_id\s*=\s*"[^"]*"/g, `database_id = "${dbId}"`);
   toml = toml.replace(/PUBLIC_POD_URL\s*=\s*"[^"]*"/, `PUBLIC_POD_URL = "${publicUrl || ""}"`);
-  if (domain) {
+  const host = domain || zoneRoute?.host;
+  if (host) {
     toml = toml.replace(/WEBAUTHN_ALLOWED_ORIGINS\s*=\s*"([^"]*)"/, (_m, val) =>
-      `WEBAUTHN_ALLOWED_ORIGINS = "${val},https://${domain}"`
+      `WEBAUTHN_ALLOWED_ORIGINS = "${val},https://${host}"`
     );
+  }
+  if (domain) {
     toml += `\n[[routes]]\npattern = "${domain}"\ncustom_domain = true\n`;
+  } else if (zoneRoute) {
+    toml += `\n[[routes]]\npattern = "${zoneRoute.pattern}"\nzone_name = "${zoneRoute.zone_name}"\n`;
   }
   writeFileSync(TOML, toml);
 }
@@ -86,17 +98,19 @@ try {
     const worker = `podlink-${base}`;
     const dbName = `podlink-${base}-db`;
     const domain = DOMAINS[base] || null;
-    console.log(`\n=== ${worker} (db ${dbName})${domain ? ` @ ${domain}` : ""} ===`);
+    const zoneRoute = ZONE_ROUTES[base] || null;
+    const publicHost = domain || zoneRoute?.host || null;
+    console.log(`\n=== ${worker} (db ${dbName})${publicHost ? ` @ ${publicHost}` : ""} ===`);
     const dbId = await ensureD1(dbName);
-    patch({ name: worker, dbId, publicUrl: "", domain });
+    patch({ name: worker, dbId, dbName, publicUrl: "", domain, zoneRoute });
     const out = await run(["wrangler", "deploy"]);
     const url = extractUrl(out);
-    if (!url && !domain) throw new Error(`no workers.dev URL for ${worker}`);
-    const publicUrl = domain ? `https://${domain}` : url;
-    patch({ name: worker, dbId, publicUrl, domain });
+    if (!url && !publicHost) throw new Error(`no workers.dev URL for ${worker}`);
+    const publicUrl = publicHost ? `https://${publicHost}` : url;
+    patch({ name: worker, dbId, dbName, publicUrl, domain, zoneRoute });
     await run(["wrangler", "deploy"], { quiet: true });
-    results[worker] = domain ? `https://${domain}` : url;
-    console.log(`URL: ${results[worker]}${domain ? `  (also ${url})` : ""}`);
+    results[worker] = publicHost ? `https://${publicHost}` : url;
+    console.log(`URL: ${results[worker]}${url && publicHost ? `  (also ${url})` : ""}`);
   }
   writeFileSync(OUT, JSON.stringify(results, null, 2) + "\n");
   console.log(`\nWrote ${OUT}`);
