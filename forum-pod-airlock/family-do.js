@@ -21,6 +21,17 @@ const REPLAY_WINDOW_MS = 5 * 60 * 1000;
 const REPLAY_CLEANUP_GRACE_MS = 60 * 1000;
 const INVITE_MAX_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+// Group-model constants. These MIRROR forum-pod/src/config/instance.js — that
+// file is the source of truth; keep these in sync. The worker is a separate
+// package and cannot import the client config directly.
+const LEGACY_ADMIN_ROLE = "admin"; // founder role in the founding group == steward
+const GROUP_ROLES = new Set(["member", "moderator", "steward"]);
+const GROUP_TYPE_RULES = {
+  community: { encryption_mode: "e2e", visibilities: new Set(["private", "members"]) },
+  issue: { encryption_mode: "server", visibilities: new Set(["private", "members", "public_read"]) },
+};
+const JOIN_POLICIES = new Set(["invite", "request", "open"]);
+
 export class FamilyDO {
   constructor(state, env) {
     this.state = state;
@@ -38,6 +49,36 @@ export class FamilyDO {
   createTables() {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS family_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      -- Phase 1 group model. A Group generalizes the original single "family".
+      -- The founding community group's membership + content continue to live in
+      -- the members / family_keys / posts ... tables below (back-compat, E2E).
+      -- Additional groups (issue lobbies, extra communities) live here + in
+      -- group_members. See forum-pod/src/config/instance.js for the source of
+      -- truth on types, visibilities, join policies, and encryption modes.
+      CREATE TABLE IF NOT EXISTS groups (
+        id TEXT PRIMARY KEY,
+        type TEXT NOT NULL DEFAULT 'community',        -- 'community' | 'issue'
+        slug TEXT,
+        enc_name TEXT,                                 -- e2e groups: encrypted name
+        name TEXT,                                     -- server-mode groups: plaintext name
+        visibility TEXT NOT NULL DEFAULT 'private',    -- 'private' | 'members' | 'public_read'
+        join_policy TEXT NOT NULL DEFAULT 'invite',    -- 'invite' | 'request' | 'open'
+        encryption_mode TEXT NOT NULL DEFAULT 'e2e',   -- 'e2e' | 'server'
+        current_epoch INTEGER NOT NULL DEFAULT 1,
+        founding INTEGER NOT NULL DEFAULT 0,           -- 1 = the instance's founding community group
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      -- Per-group membership. One row per (group, account) => one membership and
+      -- one vote per group. Roles: member | moderator | steward.
+      CREATE TABLE IF NOT EXISTS group_members (
+        group_id TEXT NOT NULL,
+        member_pub TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'member',
+        status TEXT NOT NULL DEFAULT 'pending',        -- 'pending' | 'active'
+        joined_at TEXT NOT NULL,
+        PRIMARY KEY (group_id, member_pub)
+      );
       CREATE TABLE IF NOT EXISTS members (
         member_pub TEXT PRIMARY KEY,
         x_pub TEXT,
@@ -134,6 +175,7 @@ export class FamilyDO {
     for (const tbl of [
       "family_meta", "members", "join_requests", "family_keys", "posts", "comments",
       "reactions", "events", "rsvps", "albums", "photos", "replay_guard", "invites",
+      "groups", "group_members",
     ]) {
       try {
         this.sql.exec(`DROP TABLE IF EXISTS ${tbl}`);
@@ -194,6 +236,79 @@ export class FamilyDO {
   }
   getMember(pub) {
     return this.sql.exec(`SELECT * FROM members WHERE member_pub = ?`, pub).toArray()[0] || null;
+  }
+
+  // ---- groups (Phase 1) --------------------------------------------------
+
+  foundingGroupId() {
+    return this.getMeta("founding_group_id");
+  }
+  getGroup(id) {
+    return this.sql.exec(`SELECT * FROM groups WHERE id = ?`, id).toArray()[0] || null;
+  }
+  getGroupMembership(groupId, pub) {
+    return this.sql
+      .exec(`SELECT * FROM group_members WHERE group_id = ? AND member_pub = ?`, groupId, pub)
+      .toArray()[0] || null;
+  }
+  /** A member's effective role in a group. Founding-group membership lives in the
+   *  legacy `members` table (admin => steward); other groups use group_members. */
+  groupRole(group, pub) {
+    if (!group) return null;
+    if (group.founding) {
+      const m = this.getMember(pub);
+      if (!m || m.status !== "active") return null;
+      return m.role === LEGACY_ADMIN_ROLE ? "steward" : m.role;
+    }
+    const gm = this.getGroupMembership(group.id, pub);
+    return gm && gm.status === "active" ? gm.role : null;
+  }
+  isSteward(group, pub) {
+    return this.groupRole(group, pub) === "steward";
+  }
+  isModeratorOrAbove(group, pub) {
+    const r = this.groupRole(group, pub);
+    return r === "steward" || r === "moderator";
+  }
+  /** Public view of a group (never leaks encrypted names to non-members). */
+  groupInfo(group, viewerPub) {
+    const role = this.groupRole(group, viewerPub);
+    const isMember = !!role;
+    const activeMembers = group.founding
+      ? this.sql.exec(`SELECT COUNT(*) AS n FROM members WHERE status = 'active'`).toArray()[0].n
+      : this.sql.exec(`SELECT COUNT(*) AS n FROM group_members WHERE group_id = ? AND status = 'active'`, group.id).toArray()[0].n;
+    return {
+      id: group.id,
+      type: group.type,
+      slug: group.slug || null,
+      visibility: group.visibility,
+      join_policy: group.join_policy,
+      encryption_mode: group.encryption_mode,
+      founding: !!group.founding,
+      current_epoch: group.current_epoch,
+      created_at: group.created_at,
+      member_count: activeMembers,
+      my_role: role,
+      is_member: isMember,
+      // Names: server-mode groups expose plaintext; e2e groups expose ciphertext
+      // (only members holding the key can read it client-side).
+      name: group.encryption_mode === "server" ? group.name : null,
+      enc_name: group.encryption_mode === "e2e" && group.enc_name ? JSON.parse(group.enc_name) : null,
+    };
+  }
+  /** Ensure the instance's founding community group exists (called on PROVISION). */
+  ensureFoundingGroup(founderPub, encFamilyName) {
+    let gid = this.foundingGroupId();
+    if (gid && this.getGroup(gid)) return gid;
+    gid = uid("g");
+    const now = new Date().toISOString();
+    this.sql.exec(
+      `INSERT INTO groups (id, type, slug, enc_name, name, visibility, join_policy, encryption_mode, current_epoch, founding, created_by, created_at)
+       VALUES (?, 'community', 'home', ?, NULL, 'private', 'invite', 'e2e', ?, 1, ?, ?)`,
+      gid, encFamilyName ? JSON.stringify(encFamilyName) : null, this.currentEpoch(), founderPub, now
+    );
+    this.setMeta("founding_group_id", gid);
+    return gid;
   }
 
   checkAndRecordReplay(signature, pub) {
@@ -333,6 +448,9 @@ export class FamilyDO {
           me.member_pub, epoch, JSON.stringify(data.wrapped_self), new Date().toISOString()
         );
       }
+      // Establish the instance's founding community group (E2E). Its membership
+      // continues to be tracked by the legacy `members` table for back-compat.
+      this.ensureFoundingGroup(me.member_pub, data.enc_family_name || null);
       return { status: 200, body: { ok: true, family: this.familyInfo(), me: this.getMember(me.member_pub) } };
     }
     if (verb === "GET" && path === "/family") {
@@ -587,6 +705,119 @@ export class FamilyDO {
       return { status: 200, body: { ok: true, member: me.member_pub } };
     }
 
+    // ---- groups (Phase 1) --------------------------------------------------
+    if (verb === "POST" && path === "/groups") {
+      const type = String(data.type || "");
+      const rules = GROUP_TYPE_RULES[type];
+      if (!rules) return { status: 400, body: { error: "bad_group_type" } };
+      const encryption_mode = rules.encryption_mode;
+      // Default visibility/join by type; validate any overrides.
+      const visibility = rules.visibilities.has(data.visibility)
+        ? data.visibility
+        : type === "issue" ? "members" : "private";
+      const join_policy = JOIN_POLICIES.has(data.join_policy)
+        ? data.join_policy
+        : type === "issue" ? "request" : "invite";
+      // Name: server-mode groups carry plaintext; e2e groups carry ciphertext.
+      const plainName = encryption_mode === "server" ? String(data.name || "").trim() : null;
+      const encName = encryption_mode === "e2e" ? data.enc_name || null : null;
+      if (encryption_mode === "server" && !plainName) return { status: 400, body: { error: "name_required" } };
+      const id = uid("g");
+      const now = new Date().toISOString();
+      this.sql.exec(
+        `INSERT INTO groups (id, type, slug, enc_name, name, visibility, join_policy, encryption_mode, current_epoch, founding, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)`,
+        id, type, slugify(data.slug || plainName || type), encName ? JSON.stringify(encName) : null,
+        plainName, visibility, join_policy, encryption_mode, me.member_pub, now
+      );
+      // Creator becomes the group's steward.
+      this.sql.exec(
+        `INSERT INTO group_members (group_id, member_pub, role, status, joined_at) VALUES (?, ?, 'steward', 'active', ?)`,
+        id, me.member_pub, now
+      );
+      return { status: 200, body: { ok: true, group: this.groupInfo(this.getGroup(id), me.member_pub) } };
+    }
+    if (verb === "LIST" && path === "/groups") {
+      const rows = this.sql.exec(`SELECT * FROM groups ORDER BY founding DESC, created_at`).toArray()
+        .map((g) => this.groupInfo(g, me.member_pub));
+      return { status: 200, body: { rows } };
+    }
+    if (verb === "GET" && path.startsWith("/groups/") && !path.includes("/", "/groups/".length)) {
+      const g = this.getGroup(path.slice("/groups/".length));
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      return { status: 200, body: { group: this.groupInfo(g, me.member_pub) } };
+    }
+    if (verb === "POST" && path.match(/^\/groups\/[^/]+\/join$/)) {
+      const g = this.getGroup(path.split("/")[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (g.founding) return { status: 400, body: { error: "use_family_join" } };
+      const existing = this.getGroupMembership(g.id, me.member_pub);
+      if (existing) return { status: 200, body: { ok: true, status: existing.status, role: existing.role } };
+      if (g.join_policy === "invite") return { status: 403, body: { error: "invite_required" } };
+      const status = g.join_policy === "open" ? "active" : "pending";
+      this.sql.exec(
+        `INSERT INTO group_members (group_id, member_pub, role, status, joined_at) VALUES (?, ?, 'member', ?, ?)`,
+        g.id, me.member_pub, status, new Date().toISOString()
+      );
+      return { status: 200, body: { ok: true, status } };
+    }
+    if (verb === "LIST" && path.match(/^\/groups\/[^/]+\/members$/)) {
+      const g = this.getGroup(path.split("/")[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (!this.groupRole(g, me.member_pub)) return { status: 403, body: { error: "not_a_member" } };
+      const rows = g.founding
+        ? this.sql.exec(`SELECT member_pub, role, status, joined_at FROM members ORDER BY joined_at`).toArray()
+            .map((m) => ({ ...m, role: m.role === LEGACY_ADMIN_ROLE ? "steward" : m.role }))
+        : this.sql.exec(`SELECT member_pub, role, status, joined_at FROM group_members WHERE group_id = ? ORDER BY joined_at`, g.id).toArray();
+      return { status: 200, body: { rows } };
+    }
+    if (verb === "LIST" && path.match(/^\/groups\/[^/]+\/requests$/)) {
+      const g = this.getGroup(path.split("/")[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (!this.isModeratorOrAbove(g, me.member_pub)) return { status: 403, body: { error: "steward_only" } };
+      const rows = this.sql.exec(`SELECT member_pub, joined_at FROM group_members WHERE group_id = ? AND status = 'pending' ORDER BY joined_at`, g.id).toArray();
+      return { status: 200, body: { rows } };
+    }
+    if (verb === "POST" && path.match(/^\/groups\/[^/]+\/admit$/)) {
+      const g = this.getGroup(path.split("/")[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (!this.isSteward(g, me.member_pub)) return { status: 403, body: { error: "steward_only" } };
+      const gm = this.getGroupMembership(g.id, data.member_pub);
+      if (!gm) return { status: 404, body: { error: "no_such_member" } };
+      this.sql.exec(`UPDATE group_members SET status = 'active' WHERE group_id = ? AND member_pub = ?`, g.id, data.member_pub);
+      return { status: 200, body: { ok: true } };
+    }
+    if (verb === "POST" && path.match(/^\/groups\/[^/]+\/role$/)) {
+      const g = this.getGroup(path.split("/")[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (g.founding) return { status: 400, body: { error: "founding_roles_via_family" } };
+      if (!this.isSteward(g, me.member_pub)) return { status: 403, body: { error: "steward_only" } };
+      if (!GROUP_ROLES.has(data.role)) return { status: 400, body: { error: "bad_role" } };
+      const gm = this.getGroupMembership(g.id, data.member_pub);
+      if (!gm) return { status: 404, body: { error: "no_such_member" } };
+      // Never orphan a group: keep at least one active steward.
+      if (gm.role === "steward" && data.role !== "steward") {
+        const stewards = this.sql.exec(`SELECT COUNT(*) AS n FROM group_members WHERE group_id = ? AND role = 'steward' AND status = 'active'`, g.id).toArray()[0].n;
+        if (stewards <= 1) return { status: 400, body: { error: "last_steward" } };
+      }
+      this.sql.exec(`UPDATE group_members SET role = ? WHERE group_id = ? AND member_pub = ?`, data.role, g.id, data.member_pub);
+      return { status: 200, body: { ok: true } };
+    }
+    if (verb === "POST" && path.match(/^\/groups\/[^/]+\/remove$/)) {
+      const g = this.getGroup(path.split("/")[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (g.founding) return { status: 400, body: { error: "founding_remove_via_family" } };
+      const self = data.member_pub === me.member_pub;
+      if (!self && !this.isSteward(g, me.member_pub)) return { status: 403, body: { error: "steward_only" } };
+      const gm = this.getGroupMembership(g.id, data.member_pub);
+      if (gm && gm.role === "steward") {
+        const stewards = this.sql.exec(`SELECT COUNT(*) AS n FROM group_members WHERE group_id = ? AND role = 'steward' AND status = 'active'`, g.id).toArray()[0].n;
+        if (stewards <= 1) return { status: 400, body: { error: "last_steward" } };
+      }
+      this.sql.exec(`DELETE FROM group_members WHERE group_id = ? AND member_pub = ?`, g.id, data.member_pub);
+      return { status: 200, body: { ok: true } };
+    }
+
     return { status: 404, body: { error: "route_not_found", path } };
   }
 
@@ -619,6 +850,13 @@ export class FamilyDO {
 function uid(prefix) {
   const b = crypto.getRandomValues(new Uint8Array(12));
   return `${prefix}_${Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("")}`;
+}
+function slugify(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48) || null;
 }
 function verbOf(payload) {
   return String(payload?.verb || "").toUpperCase();
