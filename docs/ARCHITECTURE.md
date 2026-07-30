@@ -178,14 +178,43 @@ policy defaults live in `forum-pod/src/config/instance.js` (ground rule #5). The
 DO mirrors the type/visibility/role enums locally (separate package) and points
 back to that file as the source of truth.
 
+### Server-mode content + Pol.is opinion mapping (implemented, backend)
+
+Server-mode groups (county boards + lobbies) hold **plaintext** content in
+`group_posts` / `group_comments`; E2E community groups keep using the ciphertext
+`posts`/`comments`/`reactions` tables instead. **Like/dislike is the Pol.is
+signal:** a `group_votes` row (`item_type`,`item_id`,`member_pub` → `vote` ∈
+{`+1` like/agree, `-1` dislike/disagree}; no row = pass) is what drives the
+opinion map — there is no separate "statement" concept, posts/comments *are* the
+statements.
+
+| Table | Key columns |
+|---|---|
+| `group_posts` | `id` (PK), `group_id`, `author_pub`, `text`, `status`, `created_at` |
+| `group_comments` | `id` (PK), `post_id`, `group_id`, `author_pub`, `text`, `status`, `created_at` |
+| `group_votes` | (`item_type`,`item_id`,`member_pub`) PK, `group_id`, `vote` (±1), `created_at` |
+
+Verbs (server-mode only; E2E groups get `400`): `POST`/`LIST /groups/:id/posts`,
+`POST`/`LIST /groups/:id/posts/:pid/comments`, `POST /groups/:id/vote`
+(`item_type`,`item_id`,`vote`; `0` clears), and `GET /groups/:id/opinion-map`.
+Viewing follows `public_read`; posting/commenting/voting requires active group
+membership. `computeOpinionMap()` is a pure function: it column-centers the
+member×item like/dislike matrix, projects members to 2D (PCA via power iteration
++ deflation), clusters them (k-means, k∈1..3 chosen by silhouette), and reports
+**opinion groups** (size + centroid), the caller's own point/cluster, and per-item
+**consensus/divisive** classification. Output is **aggregate-only** (plus the
+caller's own point) — individual vote vectors are never returned (Protocol:
+aggregate views, no behavioral export).
+
 **Still open in Phase 1:** client/UI generalization (config strings, county-board
-browser, create-lobby UI, public-signup screen); per-group content routing for
-server-mode groups (posts on county boards / lobbies) is deferred to the
-lobby-feature phases. **Roadmap (not built):** zk/verified-human (ID.me/Login.gov),
-Pol.is opinion mapping, civic.ai (blocked pending Protocol review). **Not yet built
-(later phases):** Proposal, Poll, Report, Position, District codes, transparency page.
+browser, create-lobby UI, public-signup screen, opinion-map visualization).
+**Roadmap (not built):** zk/verified-human (ID.me/Login.gov); civic.ai (blocked
+pending Protocol review). Pol.is is now **implemented first-party** (above).
+**Not yet built (later phases):** Proposal, Poll, Report, Position, District
+codes, transparency page.
 
 Tests (all pass against a fresh local `wrangler dev`):
+`forum-pod/scripts/polis-test.mjs` (opinion mapping via like/dislike),
 `forum-pod/scripts/civic-boards-test.mjs` (county boards + public signup +
 lobbies), `forum-pod/scripts/group-model-test.mjs` (Phase 1 group model), and the
 unchanged `forum-pod/scripts/family-e2e-test.mjs` (E2E regression).

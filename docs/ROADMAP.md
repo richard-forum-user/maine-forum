@@ -52,15 +52,19 @@ Maine Forum (instance)
 - **Status:** design only. Current auth is device Ed25519 keys + (optional)
   WebAuthn passkeys.
 
-### 2. Pol.is opinion mapping
-- **Goal:** import Pol.is-style opinion mapping / clustering into lobby
-  deliberation, so groups can see areas of consensus and division before voting.
-- **Approach:** prefer **self-hosting Pol.is** (open source) so member statements
-  and votes stay in-house rather than flowing to a third party. Embed or
-  re-implement the consensus-map view; feed results into Phase 2 governance.
-- **Protocol fit:** deliberation data is member content; keep it first-party,
-  aggregate views only, no per-user behavioral export.
-- **Status:** design only. No dependency or endpoint added yet.
+### 2. Pol.is opinion mapping — ✅ IMPLEMENTED (first-party)
+- **What shipped:** a Pol.is-style opinion map built into server-mode groups
+  (county boards + lobbies). A lobby's **posts and comments are the statements**;
+  **like/dislike is the agree/disagree signal**. The server clusters members from
+  their like/dislike matrix (PCA → k-means, 1–3 opinion groups chosen by
+  silhouette) and surfaces **consensus** (cross-cluster agreement) and
+  **divisive** items. Endpoint: `GET /groups/:id/opinion-map`.
+- **Protocol fit:** fully first-party — no external Pol.is service, no data
+  leaves the instance. The map returns **aggregates only** (opinion-group sizes,
+  centroids, per-item consensus) plus the caller's own point; individual vote
+  vectors are never exported.
+- **Next:** client visualization (scatter of opinion groups + consensus list);
+  feed consensus into Phase 2 governance (proposals/polls).
 
 ### 3. civic.ai data analysis — ⚠️ PENDING PROTOCOL REVIEW
 - **Goal (as proposed):** use civic.ai for data analysis of civic sentiment.
@@ -84,5 +88,6 @@ Maine Forum (instance)
 - Governance primitives (proposals, polls, audit log) are **Phase 2**.
 - verified-human sits in **Phase 3.4** (identity), promoted from this roadmap
   when ready.
-- Pol.is and civic.ai are integrations layered on Phase 2/4 once their
-  Protocol posture is settled.
+- Pol.is opinion mapping is **implemented first-party** on server-mode groups;
+  its consensus output feeds Phase 2 governance. civic.ai remains blocked
+  pending a Protocol review.

@@ -134,12 +134,23 @@ export const COUNTIES = [
   "Somerset", "Waldo", "Washington", "York",
 ];
 
-// External integrations. All roadmap-only and DISABLED — see docs/ROADMAP.md.
+// External integrations. See docs/ROADMAP.md.
 // Do not enable civic.ai without a Protocol review (third-party data flow).
 export const INTEGRATIONS = {
-  polis: { enabled: false, selfHosted: true, status: "roadmap" },
+  // Pol.is-style opinion mapping is implemented FIRST-PARTY (no external calls):
+  // in server-mode groups, like/dislike on posts/comments is the agree/disagree
+  // signal, and the server clusters members + surfaces consensus. See the
+  // `/groups/:id/opinion-map` endpoint.
+  polis: { enabled: true, firstParty: true, status: "implemented" },
   civicAi: { enabled: false, status: "blocked_pending_protocol_review" },
   verifiedHuman: { enabled: false, providers: ["idme", "logingov"], status: "roadmap" },
+};
+
+// Opinion-map tuning (client display + server thresholds mirror these).
+export const OPINION_MAP = {
+  maxClusters: 3, // server picks 1..3 opinion groups by silhouette
+  minSeparation: 0.25, // below this, treat everyone as one group
+  likeIsAgree: true, // like = +1 (agree), dislike = -1 (disagree), no vote = pass
 };
 
 export const VISIBILITIES = {

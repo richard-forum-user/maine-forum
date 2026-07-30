@@ -142,6 +142,38 @@ export class FamilyDO {
         code TEXT PRIMARY KEY, token TEXT NOT NULL, created_by TEXT NOT NULL,
         created_at TEXT NOT NULL, exp_ms INTEGER NOT NULL
       );
+      -- Server-mode group content (county boards + lobbies). Plaintext, because
+      -- these groups are server-readable; E2E community groups keep using the
+      -- ciphertext posts/comments/reactions tables above instead.
+      CREATE TABLE IF NOT EXISTS group_posts (
+        id TEXT PRIMARY KEY,
+        group_id TEXT NOT NULL,
+        author_pub TEXT NOT NULL,
+        text TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'visible',        -- 'visible' | 'hidden'
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS group_comments (
+        id TEXT PRIMARY KEY,
+        post_id TEXT NOT NULL,
+        group_id TEXT NOT NULL,
+        author_pub TEXT NOT NULL,
+        text TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'visible',
+        created_at TEXT NOT NULL
+      );
+      -- Like/dislike on a post or comment. This IS the Pol.is signal: like = +1
+      -- (agree), dislike = -1 (disagree); no row = "pass"/unseen. The opinion map
+      -- clusters members from this matrix and surfaces cross-cluster consensus.
+      CREATE TABLE IF NOT EXISTS group_votes (
+        group_id TEXT NOT NULL,
+        item_type TEXT NOT NULL,                       -- 'post' | 'comment'
+        item_id TEXT NOT NULL,
+        member_pub TEXT NOT NULL,
+        vote INTEGER NOT NULL,                          -- 1 like/agree | -1 dislike/disagree
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (item_type, item_id, member_pub)
+      );
     `);
   }
 
@@ -182,6 +214,7 @@ export class FamilyDO {
       "family_meta", "members", "join_requests", "family_keys", "posts", "comments",
       "reactions", "events", "rsvps", "albums", "photos", "replay_guard", "invites",
       "groups", "group_members",
+      "group_posts", "group_comments", "group_votes",
     ]) {
       try {
         this.sql.exec(`DROP TABLE IF EXISTS ${tbl}`);
@@ -281,6 +314,25 @@ export class FamilyDO {
   isModeratorOrAbove(group, pub) {
     const r = this.groupRole(group, pub);
     return r === "steward" || r === "moderator";
+  }
+  /** Can this viewer READ the group's public content? Members always can;
+   *  non-members can read a `public_read` group. */
+  canViewGroup(group, pub) {
+    return !!this.groupRole(group, pub) || group.visibility === "public_read";
+  }
+  /** Tally of like/dislike (Pol.is agree/disagree) on one item, + caller's vote. */
+  voteTally(itemType, itemId, pub) {
+    const rows = this.sql.exec(
+      `SELECT vote, COUNT(*) AS n FROM group_votes WHERE item_type = ? AND item_id = ? GROUP BY vote`,
+      itemType, itemId
+    ).toArray();
+    let likes = 0, dislikes = 0;
+    for (const r of rows) { if (r.vote > 0) likes = r.n; else if (r.vote < 0) dislikes = r.n; }
+    const mine = this.sql.exec(
+      `SELECT vote FROM group_votes WHERE item_type = ? AND item_id = ? AND member_pub = ?`,
+      itemType, itemId, pub
+    ).toArray()[0];
+    return { likes, dislikes, my_vote: mine ? mine.vote : 0 };
   }
   /** Public view of a group (never leaks encrypted names to non-members). */
   groupInfo(group, viewerPub) {
@@ -914,7 +966,128 @@ export class FamilyDO {
       return { status: 200, body: { ok: true } };
     }
 
+    // ---- server-mode group content + Pol.is opinion mapping ----------------
+    // Posts/comments are the deliberation "statements"; like/dislike on them is
+    // the agree/disagree signal that powers the opinion map. Server-mode only.
+    if (verb === "POST" && path.match(/^\/groups\/[^/]+\/posts$/)) {
+      const g = this.getGroup(path.split("/")[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (g.encryption_mode !== "server") return { status: 400, body: { error: "e2e_group_use_family_posts" } };
+      if (!this.groupRole(g, me.member_pub)) return { status: 403, body: { error: "not_a_member" } };
+      const text = String(data.text || "").trim().slice(0, 4000);
+      if (!text) return { status: 400, body: { error: "text_required" } };
+      const id = uid("gp");
+      this.sql.exec(
+        `INSERT INTO group_posts (id, group_id, author_pub, text, status, created_at) VALUES (?, ?, ?, ?, 'visible', ?)`,
+        id, g.id, me.member_pub, text, new Date().toISOString()
+      );
+      return { status: 200, body: { ok: true, id } };
+    }
+    if (verb === "LIST" && path.match(/^\/groups\/[^/]+\/posts$/)) {
+      const g = this.getGroup(path.split("/")[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (g.encryption_mode !== "server") return { status: 400, body: { error: "e2e_group_use_family_posts" } };
+      if (!this.canViewGroup(g, me.member_pub)) return { status: 403, body: { error: "not_a_member" } };
+      const rows = this.sql.exec(
+        `SELECT id, author_pub, text, created_at FROM group_posts WHERE group_id = ? AND status = 'visible' ORDER BY created_at DESC`, g.id
+      ).toArray().map((p) => {
+        const t = this.voteTally("post", p.id, me.member_pub);
+        const nComments = this.sql.exec(`SELECT COUNT(*) AS n FROM group_comments WHERE post_id = ? AND status = 'visible'`, p.id).toArray()[0].n;
+        return { ...p, handle: this.handleOf(p.author_pub), ...t, comment_count: nComments };
+      });
+      return { status: 200, body: { rows } };
+    }
+    if (verb === "POST" && path.match(/^\/groups\/[^/]+\/posts\/[^/]+\/comments$/)) {
+      const parts = path.split("/");
+      const g = this.getGroup(parts[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (g.encryption_mode !== "server") return { status: 400, body: { error: "e2e_group_use_family_posts" } };
+      if (!this.groupRole(g, me.member_pub)) return { status: 403, body: { error: "not_a_member" } };
+      const post = this.sql.exec(`SELECT id FROM group_posts WHERE id = ? AND group_id = ?`, parts[4], g.id).toArray()[0];
+      if (!post) return { status: 404, body: { error: "post_not_found" } };
+      const text = String(data.text || "").trim().slice(0, 2000);
+      if (!text) return { status: 400, body: { error: "text_required" } };
+      const id = uid("gc");
+      this.sql.exec(
+        `INSERT INTO group_comments (id, post_id, group_id, author_pub, text, status, created_at) VALUES (?, ?, ?, ?, ?, 'visible', ?)`,
+        id, post.id, g.id, me.member_pub, text, new Date().toISOString()
+      );
+      return { status: 200, body: { ok: true, id } };
+    }
+    if (verb === "LIST" && path.match(/^\/groups\/[^/]+\/posts\/[^/]+\/comments$/)) {
+      const parts = path.split("/");
+      const g = this.getGroup(parts[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (!this.canViewGroup(g, me.member_pub)) return { status: 403, body: { error: "not_a_member" } };
+      const rows = this.sql.exec(
+        `SELECT id, author_pub, text, created_at FROM group_comments WHERE post_id = ? AND status = 'visible' ORDER BY created_at`, parts[4]
+      ).toArray().map((c) => ({ ...c, handle: this.handleOf(c.author_pub), ...this.voteTally("comment", c.id, me.member_pub) }));
+      return { status: 200, body: { rows } };
+    }
+    // Like/dislike a post or comment (the Pol.is agree/disagree signal).
+    if (verb === "POST" && path.match(/^\/groups\/[^/]+\/vote$/)) {
+      const g = this.getGroup(path.split("/")[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (g.encryption_mode !== "server") return { status: 400, body: { error: "e2e_group_use_reactions" } };
+      if (!this.groupRole(g, me.member_pub)) return { status: 403, body: { error: "not_a_member" } };
+      const itemType = data.item_type === "comment" ? "comment" : data.item_type === "post" ? "post" : null;
+      if (!itemType) return { status: 400, body: { error: "bad_item_type" } };
+      const table = itemType === "post" ? "group_posts" : "group_comments";
+      const item = this.sql.exec(`SELECT id FROM ${table} WHERE id = ? AND group_id = ?`, data.item_id, g.id).toArray()[0];
+      if (!item) return { status: 404, body: { error: "item_not_found" } };
+      const vote = Number(data.vote);
+      if (![1, -1, 0].includes(vote)) return { status: 400, body: { error: "bad_vote" } };
+      if (vote === 0) {
+        this.sql.exec(`DELETE FROM group_votes WHERE item_type = ? AND item_id = ? AND member_pub = ?`, itemType, item.id, me.member_pub);
+      } else {
+        this.sql.exec(
+          `INSERT INTO group_votes (group_id, item_type, item_id, member_pub, vote, created_at) VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(item_type, item_id, member_pub) DO UPDATE SET vote = excluded.vote`,
+          g.id, itemType, item.id, me.member_pub, vote, new Date().toISOString()
+        );
+      }
+      return { status: 200, body: { ok: true, tally: this.voteTally(itemType, item.id, me.member_pub) } };
+    }
+    // The opinion map: cluster members by their like/dislike patterns and
+    // surface cross-cluster consensus. Aggregate-only (no per-member vote export).
+    if (verb === "GET" && path.match(/^\/groups\/[^/]+\/opinion-map$/)) {
+      const g = this.getGroup(path.split("/")[2]);
+      if (!g) return { status: 404, body: { error: "group_not_found" } };
+      if (g.encryption_mode !== "server") return { status: 400, body: { error: "e2e_group_no_opinion_map" } };
+      if (!this.canViewGroup(g, me.member_pub)) return { status: 403, body: { error: "not_a_member" } };
+      return { status: 200, body: this.opinionMap(g.id, me.member_pub) };
+    }
+
     return { status: 404, body: { error: "route_not_found", path } };
+  }
+
+  handleOf(pub) {
+    const m = this.getMember(pub);
+    return (m && m.handle) || null;
+  }
+
+  /**
+   * Pol.is-style opinion map for a server-mode group. Builds the member × item
+   * like/dislike matrix, projects members to 2D (PCA via power iteration) and
+   * clusters them (k-means), then reports each cluster's size + centroid, the
+   * caller's own position/cluster, and per-item consensus across clusters.
+   * Individual vote vectors are never returned — only aggregates + the caller's
+   * own point — to keep it Protocol-clean (aggregate views, no behavioral export).
+   */
+  opinionMap(groupId, viewerPub) {
+    const votes = this.sql.exec(
+      `SELECT item_type, item_id, member_pub, vote FROM group_votes WHERE group_id = ?`, groupId
+    ).toArray();
+    // Item metadata for labeling consensus/divisive results.
+    const itemText = (t, id) => {
+      const row = this.sql.exec(`SELECT text FROM ${t === "post" ? "group_posts" : "group_comments"} WHERE id = ?`, id).toArray()[0];
+      return row ? row.text.slice(0, 140) : null;
+    };
+    const map = computeOpinionMap(votes, viewerPub);
+    map.group_id = groupId;
+    map.statements = map.statements.map((s) => ({ ...s, text: itemText(s.item_type, s.item_id) }));
+    map.consensus = map.consensus.map((s) => ({ ...s, text: itemText(s.item_type, s.item_id) }));
+    return map;
   }
 
   familyInfo() {
@@ -947,6 +1120,174 @@ function uid(prefix) {
   const b = crypto.getRandomValues(new Uint8Array(12));
   return `${prefix}_${Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("")}`;
 }
+// ---- Pol.is-style opinion mapping (pure, testable) ------------------------
+// Given raw like/dislike votes, cluster members by their voting patterns and
+// report aggregate opinion groups + cross-cluster consensus. No external calls.
+function computeOpinionMap(votes, viewerPub) {
+  const members = [...new Set(votes.map((v) => v.member_pub))];
+  const itemKeys = [...new Set(votes.map((v) => `${v.item_type}:${v.item_id}`))];
+  const P = members.length, N = itemKeys.length;
+  const empty = {
+    participant_count: P, item_count: N, opinion_groups: [], points: [],
+    my_cluster: null, statements: [], consensus: [],
+  };
+  if (P === 0 || N === 0) return empty;
+  const mi = new Map(members.map((m, i) => [m, i]));
+  const ii = new Map(itemKeys.map((k, i) => [k, i]));
+  const M = Array.from({ length: P }, () => new Array(N).fill(0));
+  for (const v of votes) M[mi.get(v.member_pub)][ii.get(`${v.item_type}:${v.item_id}`)] = v.vote > 0 ? 1 : v.vote < 0 ? -1 : 0;
+
+  // Column-center, then project members to 2D via the top-2 principal comps.
+  const colMean = new Array(N).fill(0);
+  for (let j = 0; j < N; j++) { let s = 0; for (let i = 0; i < P; i++) s += M[i][j]; colMean[j] = s / P; }
+  const Mc = M.map((row) => row.map((x, j) => x - colMean[j]));
+  let coords;
+  if (P >= 2) {
+    const C = itemCovariance(Mc, P, N);
+    const v1 = powerIteration(C, N);
+    const l1 = rayleigh(C, v1);
+    const C2 = deflate(C, v1, l1);
+    const v2 = powerIteration(C2, N);
+    coords = Mc.map((row) => [dotv(row, v1), dotv(row, v2)]);
+  } else {
+    coords = Mc.map(() => [0, 0]);
+  }
+
+  // Pick k in {1,2,3} by silhouette; assign clusters.
+  const assign = chooseClusters(coords);
+  const k = Math.max(1, ...assign.map((c) => c + 1));
+  const groups = [];
+  for (let c = 0; c < k; c++) {
+    const idx = assign.map((a, i) => (a === c ? i : -1)).filter((i) => i >= 0);
+    if (!idx.length) continue;
+    const cx = idx.reduce((s, i) => s + coords[i][0], 0) / idx.length;
+    const cy = idx.reduce((s, i) => s + coords[i][1], 0) / idx.length;
+    groups.push({ cluster: c, size: idx.length, centroid: [round4(cx), round4(cy)] });
+  }
+  const myIdx = mi.has(viewerPub) ? mi.get(viewerPub) : -1;
+  const points = coords.map((p, i) => ({ x: round4(p[0]), y: round4(p[1]), cluster: assign[i], is_me: i === myIdx }));
+  const my_cluster = myIdx >= 0 ? assign[myIdx] : null;
+
+  // Per-item consensus across clusters.
+  const statements = itemKeys.map((key, j) => {
+    const [item_type, item_id] = splitKey(key);
+    let agrees = 0, disagrees = 0;
+    const perCluster = Array.from({ length: k }, () => ({ agree: 0, disagree: 0 }));
+    for (let i = 0; i < P; i++) {
+      const val = M[i][j];
+      if (val > 0) { agrees++; perCluster[assign[i]].agree++; }
+      else if (val < 0) { disagrees++; perCluster[assign[i]].disagree++; }
+    }
+    const voted = agrees + disagrees;
+    const by_group = perCluster.map((g, c) => {
+      const n = g.agree + g.disagree;
+      return { cluster: c, n, agree_pct: n ? round4(g.agree / n) : null, lean: n ? Math.sign(g.agree - g.disagree) : 0 };
+    });
+    const activeLeans = by_group.filter((g) => g.n > 0).map((g) => g.lean);
+    const divisive = activeLeans.some((s) => s > 0) && activeLeans.some((s) => s < 0);
+    const sameDir = activeLeans.length >= 2 && activeLeans.every((s) => s > 0) || activeLeans.length >= 2 && activeLeans.every((s) => s < 0);
+    const consensus = sameDir && !divisive;
+    const consensus_score = consensus ? Math.min(...by_group.filter((g) => g.n > 0).map((g) => Math.abs((g.agree_pct ?? 0.5) - 0.5) * 2)) : 0;
+    return {
+      item_type, item_id, votes: voted, agrees, disagrees,
+      agree_pct: voted ? round4(agrees / voted) : null,
+      by_group, divisive, consensus, consensus_score: round4(consensus_score),
+    };
+  });
+  const consensus = statements.filter((s) => s.consensus).sort((a, b) => b.consensus_score - a.consensus_score).slice(0, 5);
+  return { participant_count: P, item_count: N, opinion_groups: groups, points, my_cluster, statements, consensus };
+}
+function dotv(a, b) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; }
+function itemCovariance(Mc, P, N) {
+  const C = Array.from({ length: N }, () => new Array(N).fill(0));
+  for (let a = 0; a < N; a++) for (let b = a; b < N; b++) {
+    let s = 0; for (let i = 0; i < P; i++) s += Mc[i][a] * Mc[i][b];
+    C[a][b] = C[b][a] = s / P;
+  }
+  return C;
+}
+function powerIteration(C, N, iters = 100) {
+  let v = new Array(N).fill(0).map((_, i) => Math.sin(i + 1)); // deterministic seed
+  let norm = Math.hypot(...v) || 1; v = v.map((x) => x / norm);
+  for (let it = 0; it < iters; it++) {
+    const w = new Array(N).fill(0);
+    for (let a = 0; a < N; a++) { let s = 0; for (let b = 0; b < N; b++) s += C[a][b] * v[b]; w[a] = s; }
+    norm = Math.hypot(...w);
+    if (norm < 1e-12) return new Array(N).fill(0);
+    v = w.map((x) => x / norm);
+  }
+  return v;
+}
+function rayleigh(C, v) {
+  const N = v.length; const w = new Array(N).fill(0);
+  for (let a = 0; a < N; a++) { let s = 0; for (let b = 0; b < N; b++) s += C[a][b] * v[b]; w[a] = s; }
+  return dotv(v, w);
+}
+function deflate(C, v, l) {
+  const N = v.length; const D = C.map((row) => row.slice());
+  for (let a = 0; a < N; a++) for (let b = 0; b < N; b++) D[a][b] -= l * v[a] * v[b];
+  return D;
+}
+function chooseClusters(coords) {
+  const P = coords.length;
+  if (P < 3) return coords.map(() => 0);
+  const maxK = Math.min(3, P - 1);
+  let best = { k: 1, assign: coords.map(() => 0), score: -Infinity };
+  for (let k = 2; k <= maxK; k++) {
+    const assign = kmeans(coords, k);
+    const score = silhouette(coords, assign, k);
+    if (score > best.score) best = { k, assign, score };
+  }
+  // Require a meaningful separation to prefer >1 cluster.
+  if (best.score < 0.25) return coords.map(() => 0);
+  return best.assign;
+}
+function kmeans(coords, k, iters = 50) {
+  const P = coords.length;
+  // Farthest-first deterministic init.
+  const centers = [coords[0].slice()];
+  while (centers.length < k) {
+    let bi = 0, bd = -1;
+    for (let i = 0; i < P; i++) {
+      const d = Math.min(...centers.map((c) => dist2(coords[i], c)));
+      if (d > bd) { bd = d; bi = i; }
+    }
+    centers.push(coords[bi].slice());
+  }
+  let assign = new Array(P).fill(0);
+  for (let it = 0; it < iters; it++) {
+    let changed = false;
+    for (let i = 0; i < P; i++) {
+      let bc = 0, bd = Infinity;
+      for (let c = 0; c < k; c++) { const d = dist2(coords[i], centers[c]); if (d < bd) { bd = d; bc = c; } }
+      if (assign[i] !== bc) { assign[i] = bc; changed = true; }
+    }
+    for (let c = 0; c < k; c++) {
+      const idx = []; for (let i = 0; i < P; i++) if (assign[i] === c) idx.push(i);
+      if (idx.length) { centers[c] = [idx.reduce((s, i) => s + coords[i][0], 0) / idx.length, idx.reduce((s, i) => s + coords[i][1], 0) / idx.length]; }
+    }
+    if (!changed) break;
+  }
+  return assign;
+}
+function silhouette(coords, assign, k) {
+  const P = coords.length; if (k < 2) return -Infinity;
+  let total = 0;
+  for (let i = 0; i < P; i++) {
+    const same = []; const other = Array.from({ length: k }, () => []);
+    for (let j = 0; j < P; j++) { if (j === i) continue; if (assign[j] === assign[i]) same.push(j); else other[assign[j]].push(j); }
+    const a = same.length ? same.reduce((s, j) => s + Math.sqrt(dist2(coords[i], coords[j])), 0) / same.length : 0;
+    let b = Infinity;
+    for (let c = 0; c < k; c++) { if (c === assign[i] || !other[c].length) continue; const d = other[c].reduce((s, j) => s + Math.sqrt(dist2(coords[i], coords[j])), 0) / other[c].length; if (d < b) b = d; }
+    if (b === Infinity) continue;
+    total += (b - a) / Math.max(a, b || 1);
+  }
+  return total / P;
+}
+function dist2(a, b) { const dx = a[0] - b[0], dy = a[1] - b[1]; return dx * dx + dy * dy; }
+function round4(x) { return Math.round(x * 1e4) / 1e4; }
+function splitKey(key) { const i = key.indexOf(":"); return [key.slice(0, i), key.slice(i + 1)]; }
+
 function slugify(s) {
   return String(s || "")
     .toLowerCase()
