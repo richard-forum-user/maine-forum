@@ -1,16 +1,30 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { styles as s, t } from "../ui/theme.js";
-import { createFamily, joinFamily, parseInviteFromLocation } from "./family-client.js";
+import { createFamily, joinFamily, hasInviteInUrl, loadInvite } from "./family-client.js";
 import { setFamilyReady, saveFamilyProfile } from "./family-store.js";
 import InstallAppButton from "./InstallAppButton.jsx";
 
 export default function FamilyWizard({ onDone }) {
-  const invite = parseInviteFromLocation();
-  const [mode, setMode] = useState(invite ? "join" : "choose");
+  const hasInvite = hasInviteInUrl();
+  const [mode, setMode] = useState(hasInvite ? "join" : "choose");
+  const [invite, setInvite] = useState(null);
+  const [resolving, setResolving] = useState(hasInvite);
   const [familyName, setFamilyName] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+
+  useEffect(() => {
+    if (!hasInvite) return;
+    let alive = true;
+    loadInvite()
+      .then((tok) => alive && setInvite(tok))
+      .catch(() => alive && setInvite(null))
+      .finally(() => alive && setResolving(false));
+    return () => {
+      alive = false;
+    };
+  }, [hasInvite]);
 
   async function doCreate() {
     setErr("");
@@ -112,22 +126,28 @@ export default function FamilyWizard({ onDone }) {
         {mode === "join" && (
           <div style={{ ...s.card, display: "grid", gap: 14 }}>
             <div style={{ fontWeight: 700, fontSize: 16 }}>Join your family</div>
-            <div style={{ color: t.dim, fontSize: 13 }}>
-              {invite
-                ? "You've been invited. Enter your name to join."
-                : "Open the invite link your family admin sent you, then enter your name."}
-            </div>
-            <div>
-              <label style={s.label}>Your name</label>
-              <input style={s.input} value={displayName} placeholder="e.g. Grandpa" onChange={(e) => setDisplayName(e.target.value)} />
-            </div>
-            {err && <div style={{ color: t.bad, fontSize: 13 }}>{err}</div>}
-            <div style={{ display: "flex", gap: 8 }}>
-              <button style={s.btn("ghost")} onClick={() => setMode("choose")} disabled={busy}>Back</button>
-              <button style={{ ...s.btn("primary"), flex: 1 }} onClick={doJoin} disabled={busy || !invite}>
-                {busy ? "Joining\u2026" : "Join family"}
-              </button>
-            </div>
+            {resolving ? (
+              <div style={{ color: t.dim, fontSize: 13 }}>Checking your invite{"\u2026"}</div>
+            ) : (
+              <>
+                <div style={{ color: invite ? t.dim : t.bad, fontSize: 13 }}>
+                  {invite
+                    ? "You've been invited. Enter your name to join."
+                    : "This invite link is invalid or has expired. Ask the family admin for a fresh link."}
+                </div>
+                <div>
+                  <label style={s.label}>Your name</label>
+                  <input style={s.input} value={displayName} placeholder="e.g. Grandpa" onChange={(e) => setDisplayName(e.target.value)} disabled={!invite} />
+                </div>
+                {err && <div style={{ color: t.bad, fontSize: 13 }}>{err}</div>}
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button style={s.btn("ghost")} onClick={() => setMode("choose")} disabled={busy}>Back</button>
+                  <button style={{ ...s.btn("primary"), flex: 1 }} onClick={doJoin} disabled={busy || !invite}>
+                    {busy ? "Joining\u2026" : "Join family"}
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         )}
       </div>

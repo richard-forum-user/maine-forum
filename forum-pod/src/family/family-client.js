@@ -99,9 +99,23 @@ export async function createFamily({ familyName, displayName }) {
 
 /** Join an existing family: attach our X key + a name sealed to the admin. */
 export async function joinFamily({ token, displayName }) {
+  if (!isValidInvite(token)) {
+    throw new Error("This invite link is invalid or was made by an older version. Ask the family admin for a fresh link.");
+  }
   const myX = getDeviceX();
   const sealed_name = sealTo(token.admin_x, myX, JSON.stringify({ name: displayName }));
   return rpc("POST", "/join", { token, x_pub: myX.publicKeyHex, sealed_name });
+}
+
+/** A usable invite must carry the admin's signing + key-wrap public keys. */
+export function isValidInvite(token) {
+  return !!(
+    token &&
+    typeof token.admin_x === "string" && /^[0-9a-fA-F]{64}$/.test(token.admin_x) &&
+    typeof token.admin_pub === "string" &&
+    typeof token.sig === "string" &&
+    typeof token.exp === "string" && Date.parse(token.exp) > Date.now()
+  );
 }
 
 export function getFamilyRaw() {
@@ -215,15 +229,58 @@ export async function makeInvite({ ttlMs = INVITE_DEFAULT_TTL_MS } = {}) {
   return { exp, nonce, admin_pub: publicKeyHex, admin_x: myX.publicKeyHex, sig: signatureHex };
 }
 
-export function inviteLink(token, origin = window.location.origin) {
-  const encoded = b64urlEncode(JSON.stringify(token));
-  return `${origin.replace(/\/+$/, "")}/pod#join=${encoded}`;
+/**
+ * Create a shareable invite: sign a token, store it in the DO, and get back a
+ * short code. The link carries only the code (e.g. #i=K7Q2M9XT) so it stays
+ * short and survives being pasted into chat apps.
+ */
+export async function createInvite(opts = {}) {
+  const token = await makeInvite(opts);
+  const { code } = await rpc("POST", "/invites", { token });
+  return { code, link: inviteLink(code), exp: token.exp };
 }
-export function parseInviteFromLocation() {
-  const m = (window.location.hash || "").match(/join=([^&]+)/);
-  if (!m) return null;
+
+export function inviteLink(code, origin = window.location.origin) {
+  return `${origin.replace(/\/+$/, "")}/pod#i=${encodeURIComponent(code)}`;
+}
+
+/** Read an invite reference from the URL hash (short code or legacy inline). */
+export function readInviteRef() {
+  const hash = window.location.hash || "";
+  const code = hash.match(/[#&]i=([^&]+)/);
+  if (code) return { type: "code", value: decodeURIComponent(code[1]) };
+  const inline = hash.match(/[#&]join=([^&]+)/);
+  if (inline) return { type: "inline", value: inline[1] };
+  return null;
+}
+export function hasInviteInUrl() {
+  return !!readInviteRef();
+}
+
+/** Resolve an invite reference to a validated token, or null if bad/expired. */
+export async function loadInvite(ref = readInviteRef()) {
+  if (!ref) return null;
   try {
-    return JSON.parse(b64urlDecode(m[1]));
+    let token;
+    if (ref.type === "inline") {
+      token = JSON.parse(b64urlDecode(ref.value));
+    } else {
+      const r = await rpc("GET", `/invite/${ref.value}`);
+      token = r?.token;
+    }
+    return isValidInvite(token) ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Back-compat: synchronous parse of a legacy inline invite (no server call). */
+export function parseInviteFromLocation() {
+  const ref = readInviteRef();
+  if (!ref || ref.type !== "inline") return null;
+  try {
+    const token = JSON.parse(b64urlDecode(ref.value));
+    return isValidInvite(token) ? token : null;
   } catch {
     return null;
   }

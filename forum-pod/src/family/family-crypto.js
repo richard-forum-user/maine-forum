@@ -34,6 +34,9 @@ export function bytesToHex(b) {
   return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 export function hexToBytes(hex) {
+  if (typeof hex !== "string" || hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) {
+    throw new Error("Expected a hex string");
+  }
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
   return out;

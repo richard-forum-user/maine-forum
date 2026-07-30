@@ -6,8 +6,7 @@ import {
   admitMember,
   denyMember,
   removeMember,
-  makeInvite,
-  inviteLink,
+  createInvite,
 } from "./family-client.js";
 
 export default function Members({ me, onChanged }) {
@@ -38,7 +37,8 @@ export default function Members({ me, onChanged }) {
     setBusy(true);
     setErr("");
     try {
-      setLink(inviteLink(await makeInvite()));
+      const { link } = await createInvite();
+      setLink(link);
       setCopied(false);
     } catch (e) {
       setErr(e.message);

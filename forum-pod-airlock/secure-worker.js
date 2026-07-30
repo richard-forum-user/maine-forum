@@ -133,8 +133,10 @@ async function forwardPodRpc(request, env, bodyText, bundle) {
 }
 
 function familyStub(env) {
-  // Single shared space per deployment. The instance name is versioned so a
-  // fresh deployment can start from a clean roster if ever needed.
+  // Single shared space per deployment. This instance name is STABLE and must
+  // NEVER be changed/versioned again — bumping it spins up an empty DO and
+  // orphans the family's entire history, forcing everyone to re-onboard.
+  // Schema changes are handled in-place via FamilyDO.migrate() instead.
   const id = env.FAMILY.idFromName('family-space-v2');
   return env.FAMILY.get(id);
 }

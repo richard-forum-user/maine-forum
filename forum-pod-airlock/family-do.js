@@ -30,6 +30,12 @@ export class FamilyDO {
   }
 
   initSchema() {
+    this.reconcileLegacySchema();
+    this.createTables();
+    this.migrate();
+  }
+
+  createTables() {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS family_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS members (
@@ -85,7 +91,81 @@ export class FamilyDO {
       CREATE TABLE IF NOT EXISTS replay_guard (
         signature TEXT PRIMARY KEY, public_key TEXT NOT NULL, seen_at_ms INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS invites (
+        code TEXT PRIMARY KEY, token TEXT NOT NULL, created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL, exp_ms INTEGER NOT NULL
+      );
     `);
+  }
+
+  /**
+   * Self-heal instances created under a pre-E2E schema. Early builds gave
+   * `members` a `display_name TEXT NOT NULL` column (and posts/events a `body`
+   * column); because CREATE TABLE IF NOT EXISTS never rebuilds an existing
+   * table, those stale NOT NULL columns stick around and break inserts.
+   *
+   * If we detect that legacy shape AND the family has no real data yet, we drop
+   * the content tables so createTables() can rebuild them cleanly. This is
+   * strictly guarded by emptiness so a live family's data is never touched, and
+   * it lets us keep a STABLE instance name instead of ever bumping it.
+   */
+  reconcileLegacySchema() {
+    let legacy = false;
+    try {
+      const cols = this.sql.exec(`PRAGMA table_info(members)`).toArray().map((c) => c.name);
+      // Pre-E2E members carried a `display_name` column (NOT NULL) that the
+      // current schema dropped. Its presence marks a stale instance.
+      legacy = cols.includes("display_name");
+    } catch {
+      legacy = false;
+    }
+    if (!legacy) return;
+
+    let hasData = false;
+    try {
+      const founded = this.sql.exec(`SELECT 1 FROM family_meta WHERE key = 'created_at'`).toArray()[0];
+      const nMembers = this.sql.exec(`SELECT COUNT(*) AS n FROM members`).toArray()[0]?.n || 0;
+      hasData = !!founded || nMembers > 0;
+    } catch {
+      hasData = false;
+    }
+    if (hasData) return; // never destroy a live family's data
+
+    for (const tbl of [
+      "family_meta", "members", "join_requests", "family_keys", "posts", "comments",
+      "reactions", "events", "rsvps", "albums", "photos", "replay_guard", "invites",
+    ]) {
+      try {
+        this.sql.exec(`DROP TABLE IF EXISTS ${tbl}`);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /**
+   * In-place, additive schema migrations. The DO instance name is STABLE and
+   * must never be versioned/bumped (doing so orphans the family's data). When
+   * a future update needs a new column, add it to CREATE TABLE above (for fresh
+   * instances) AND to this list (for existing instances). Duplicate-column
+   * errors are expected and ignored, so this is safe to run on every boot.
+   */
+  migrate() {
+    const additions = [
+      ["members", "x_pub", "TEXT"],
+      ["members", "status", "TEXT NOT NULL DEFAULT 'pending'"],
+      ["members", "enc_name", "TEXT"],
+      ["members", "name_epoch", "INTEGER"],
+      ["photos", "ct", "TEXT"],
+      // Future columns go here as ["table", "column", "TYPE ...DEFAULT..."].
+    ];
+    for (const [table, column, type] of additions) {
+      try {
+        this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      } catch {
+        /* column already exists — expected on fresh/already-migrated schemas */
+      }
+    }
   }
 
   // ---- meta / members ----------------------------------------------------
@@ -168,6 +248,20 @@ export class FamilyDO {
 
     if (this.checkAndRecordReplay(bundle.signature, publicKeyHex)) {
       return jsonResp(401, { error: "auth_failed", reason: "replay_detected" });
+    }
+
+    // Public: resolve a short invite code -> full token. A brand-new device is
+    // not yet a member, so this must be reachable before the membership gate.
+    // The token holds only public keys + a signature, never any secret.
+    if (verbOf(payload) === "GET" && pathOf(payload).startsWith("/invite/")) {
+      const code = normalizeCode(pathOf(payload).slice("/invite/".length));
+      const row = this.sql.exec(`SELECT token, exp_ms FROM invites WHERE code = ?`, code).toArray()[0];
+      if (!row) return jsonResp(404, { error: "invite_not_found" });
+      if (row.exp_ms < Date.now()) {
+        this.sql.exec(`DELETE FROM invites WHERE code = ?`, code);
+        return jsonResp(410, { error: "invite_expired" });
+      }
+      return jsonResp(200, { token: JSON.parse(row.token) });
     }
 
     if (!this.getMember(publicKeyHex)) {
@@ -328,6 +422,31 @@ export class FamilyDO {
       this.setMeta("current_epoch", String(newEpoch));
       if (data.enc_family_name) this.setMeta("enc_family_name", JSON.stringify(data.enc_family_name));
       return { status: 200, body: { ok: true, current_epoch: newEpoch } };
+    }
+
+    // ---- invites (admin stores a token; joiners fetch it by short code) ----
+    if (verb === "POST" && path === "/invites") {
+      if (!this.requireAdmin()) return { status: 403, body: { error: "admin_only" } };
+      const token = data.token;
+      if (!token || !token.sig || !token.exp || !token.admin_pub || !token.admin_x) {
+        return { status: 400, body: { error: "bad_token" } };
+      }
+      const expMs = Date.parse(token.exp);
+      if (Number.isNaN(expMs) || expMs < Date.now() || expMs - Date.now() > INVITE_MAX_TTL_MS) {
+        return { status: 400, body: { error: "bad_expiry" } };
+      }
+      // Prune expired codes opportunistically, then mint a unique short code.
+      this.sql.exec(`DELETE FROM invites WHERE exp_ms < ?`, Date.now());
+      let code;
+      for (let i = 0; i < 5; i++) {
+        code = makeInviteCode();
+        if (!this.sql.exec(`SELECT 1 FROM invites WHERE code = ?`, code).toArray()[0]) break;
+      }
+      this.sql.exec(
+        `INSERT INTO invites (code, token, created_by, created_at, exp_ms) VALUES (?, ?, ?, ?, ?)`,
+        code, JSON.stringify(token), me.member_pub, new Date().toISOString(), expMs
+      );
+      return { status: 200, body: { code, exp: token.exp } };
     }
 
     // ---- feed ----
@@ -500,6 +619,23 @@ export class FamilyDO {
 function uid(prefix) {
   const b = crypto.getRandomValues(new Uint8Array(12));
   return `${prefix}_${Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("")}`;
+}
+function verbOf(payload) {
+  return String(payload?.verb || "").toUpperCase();
+}
+function pathOf(payload) {
+  return String(payload?.path || "");
+}
+// Crockford-ish base32, no ambiguous chars (0/O, 1/I/L). Case-insensitive.
+const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+function makeInviteCode(len = 8) {
+  const bytes = crypto.getRandomValues(new Uint8Array(len));
+  let out = "";
+  for (const b of bytes) out += CODE_ALPHABET[b % CODE_ALPHABET.length];
+  return out;
+}
+function normalizeCode(raw) {
+  return String(raw || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 function jsonResp(status, body, extraHeaders = {}) {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...extraHeaders } });

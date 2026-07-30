@@ -19,6 +19,13 @@ if (names.length === 0) {
   process.exit(1);
 }
 
+// Custom domains per pod. Attaching a custom_domain route makes Cloudflare
+// create the DNS record + edge certificate automatically (zone must be on this
+// account). Keeping it here means every redeploy re-asserts the domain.
+const DOMAINS = {
+  family: "family.yourcommunity.forum",
+};
+
 function exec(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { cwd: WORKER, env: process.env });
@@ -50,11 +57,19 @@ async function ensureD1(dbName) {
   return id;
 }
 
-function patch({ name, dbId, publicUrl }) {
-  let toml = readFileSync(TOML, "utf8");
+function patch({ name, dbId, publicUrl, domain }) {
+  // Always start from the pristine template so custom-domain blocks and
+  // origin lists don't accumulate across the two-phase deploy.
+  let toml = template;
   toml = toml.replace(/^name\s*=\s*".*"/m, `name = "${name}"`);
   toml = toml.replace(/database_id\s*=\s*"[^"]*"/g, `database_id = "${dbId}"`);
   toml = toml.replace(/PUBLIC_POD_URL\s*=\s*"[^"]*"/, `PUBLIC_POD_URL = "${publicUrl || ""}"`);
+  if (domain) {
+    toml = toml.replace(/WEBAUTHN_ALLOWED_ORIGINS\s*=\s*"([^"]*)"/, (_m, val) =>
+      `WEBAUTHN_ALLOWED_ORIGINS = "${val},https://${domain}"`
+    );
+    toml += `\n[[routes]]\npattern = "${domain}"\ncustom_domain = true\n`;
+  }
   writeFileSync(TOML, toml);
 }
 
@@ -70,16 +85,18 @@ try {
   for (const base of names) {
     const worker = `podlink-${base}`;
     const dbName = `podlink-${base}-db`;
-    console.log(`\n=== ${worker} (db ${dbName}) ===`);
+    const domain = DOMAINS[base] || null;
+    console.log(`\n=== ${worker} (db ${dbName})${domain ? ` @ ${domain}` : ""} ===`);
     const dbId = await ensureD1(dbName);
-    patch({ name: worker, dbId, publicUrl: "" });
+    patch({ name: worker, dbId, publicUrl: "", domain });
     const out = await run(["wrangler", "deploy"]);
     const url = extractUrl(out);
-    if (!url) throw new Error(`no workers.dev URL for ${worker}`);
-    patch({ name: worker, dbId, publicUrl: url });
+    if (!url && !domain) throw new Error(`no workers.dev URL for ${worker}`);
+    const publicUrl = domain ? `https://${domain}` : url;
+    patch({ name: worker, dbId, publicUrl, domain });
     await run(["wrangler", "deploy"], { quiet: true });
-    results[worker] = url;
-    console.log(`URL: ${url}`);
+    results[worker] = domain ? `https://${domain}` : url;
+    console.log(`URL: ${results[worker]}${domain ? `  (also ${url})` : ""}`);
   }
   writeFileSync(OUT, JSON.stringify(results, null, 2) + "\n");
   console.log(`\nWrote ${OUT}`);
