@@ -31,6 +31,14 @@ export default defineConfig(() => {
     plugins: [react()],
     base: process.env.VITE_BASE || '/',
     server: {
+      // In dev, proxy the DO API to a local `wrangler dev`. Override the target
+      // with VITE_API_TARGET if your worker runs on a different port.
+      proxy: {
+        '/api': {
+          target: process.env.VITE_API_TARGET || 'http://localhost:8787',
+          changeOrigin: true,
+        },
+      },
       sourcemapIgnoreList(sourcePath) {
         return sourcePath.includes('node_modules/@duckdb')
       },

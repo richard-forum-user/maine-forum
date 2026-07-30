@@ -1,6 +1,6 @@
 import React from "react";
-import FamilyApp from "./family/FamilyApp.jsx";
+import CivicApp from "./civic/CivicApp.jsx";
 
 export default function PodlinkApp() {
-  return <FamilyApp />;
+  return <CivicApp />;
 }
