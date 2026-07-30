@@ -27,10 +27,15 @@ const INVITE_MAX_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const LEGACY_ADMIN_ROLE = "admin"; // founder role in the founding group == steward
 const GROUP_ROLES = new Set(["member", "moderator", "steward"]);
 const GROUP_TYPE_RULES = {
-  community: { encryption_mode: "e2e", visibilities: new Set(["private", "members"]) },
-  issue: { encryption_mode: "server", visibilities: new Set(["private", "members", "public_read"]) },
+  // county boards are the base civic tier: server-readable, top-level (no parent).
+  county: { encryption_mode: "server", visibilities: new Set(["members", "public_read"]), tier: "base", parentType: null },
+  // issue lobbies nest inside a county board.
+  issue: { encryption_mode: "server", visibilities: new Set(["private", "members", "public_read"]), tier: "lobby", parentType: "county" },
+  // community groups are private + end-to-end encrypted (family-style).
+  community: { encryption_mode: "e2e", visibilities: new Set(["private", "members"]), tier: "group", parentType: null },
 };
 const JOIN_POLICIES = new Set(["invite", "request", "open"]);
+const INSTANCE_JOIN_POLICIES = new Set(["invite", "open"]);
 
 export class FamilyDO {
   constructor(state, env) {
@@ -57,7 +62,8 @@ export class FamilyDO {
       -- truth on types, visibilities, join policies, and encryption modes.
       CREATE TABLE IF NOT EXISTS groups (
         id TEXT PRIMARY KEY,
-        type TEXT NOT NULL DEFAULT 'community',        -- 'community' | 'issue'
+        type TEXT NOT NULL DEFAULT 'community',        -- 'county' | 'issue' | 'community'
+        parent_group_id TEXT,                          -- lobbies nest under a county board
         slug TEXT,
         enc_name TEXT,                                 -- e2e groups: encrypted name
         name TEXT,                                     -- server-mode groups: plaintext name
@@ -198,7 +204,9 @@ export class FamilyDO {
       ["members", "status", "TEXT NOT NULL DEFAULT 'pending'"],
       ["members", "enc_name", "TEXT"],
       ["members", "name_epoch", "INTEGER"],
+      ["members", "handle", "TEXT"], // plaintext pseudonymous handle (public civic layer)
       ["photos", "ct", "TEXT"],
+      ["groups", "parent_group_id", "TEXT"], // lobbies nest under a county board
       // Future columns go here as ["table", "column", "TYPE ...DEFAULT..."].
     ];
     for (const [table, column, type] of additions) {
@@ -258,6 +266,10 @@ export class FamilyDO {
     if (group.founding) {
       const m = this.getMember(pub);
       if (!m || m.status !== "active") return null;
+      // A public-signup instance account is NOT a member of the private E2E
+      // founding group unless it holds a wrapped key (was admitted into it).
+      const hasKey = this.sql.exec(`SELECT 1 FROM family_keys WHERE member_pub = ? LIMIT 1`, pub).toArray()[0];
+      if (!hasKey) return null;
       return m.role === LEGACY_ADMIN_ROLE ? "steward" : m.role;
     }
     const gm = this.getGroupMembership(group.id, pub);
@@ -280,6 +292,7 @@ export class FamilyDO {
     return {
       id: group.id,
       type: group.type,
+      parent_group_id: group.parent_group_id || null,
       slug: group.slug || null,
       visibility: group.visibility,
       join_policy: group.join_policy,
@@ -345,6 +358,32 @@ export class FamilyDO {
     return true;
   }
 
+  instanceJoinPolicy() {
+    return this.getMeta("instance_join_policy") || "invite";
+  }
+
+  /**
+   * Public signup (pilot): when the instance join policy is `open`, any device
+   * may self-register as an active instance member with a PSEUDONYMOUS handle.
+   * No real name, no invite, no ID. Server-readable civic layer only — this does
+   * NOT grant membership in the private E2E founding group (that needs a key).
+   */
+  async tryRegister(payload, pub) {
+    if (!payload || payload.verb !== "POST" || payload.path !== "/register") return false;
+    if (this.memberCount() === 0) return false; // instance must be founded first
+    if (this.instanceJoinPolicy() !== "open") return false;
+    const data = payload.data || {};
+    const handle = sanitizeHandle(data.handle);
+    if (!handle) return false;
+    const now = new Date().toISOString();
+    this.sql.exec(
+      `INSERT INTO members (member_pub, x_pub, role, status, handle, joined_at) VALUES (?, ?, 'member', 'active', ?, ?)
+       ON CONFLICT(member_pub) DO UPDATE SET handle = excluded.handle`,
+      pub, data.x_pub || null, handle, now
+    );
+    return true;
+  }
+
   // ---- fetch / auth ------------------------------------------------------
 
   async fetch(request) {
@@ -389,6 +428,8 @@ export class FamilyDO {
         );
         this.setMeta("created_at", now);
         this.setMeta("current_epoch", "1");
+      } else if (await this.tryRegister(payload, publicKeyHex)) {
+        // self-registered as an active instance member (open signup)
       } else if (await this.tryJoinWithInvite(payload, publicKeyHex)) {
         // enrolled as pending
       } else if (isFounding) {
@@ -451,10 +492,27 @@ export class FamilyDO {
       // Establish the instance's founding community group (E2E). Its membership
       // continues to be tracked by the legacy `members` table for back-compat.
       this.ensureFoundingGroup(me.member_pub, data.enc_family_name || null);
+      // Instance signup policy (pilot passes 'open' for public signup).
+      if (INSTANCE_JOIN_POLICIES.has(data.instance_join_policy)) {
+        this.setMeta("instance_join_policy", data.instance_join_policy);
+      }
+      if (data.handle) this.sql.exec(`UPDATE members SET handle = ? WHERE member_pub = ?`, sanitizeHandle(data.handle), me.member_pub);
       return { status: 200, body: { ok: true, family: this.familyInfo(), me: this.getMember(me.member_pub) } };
     }
     if (verb === "GET" && path === "/family") {
       return { status: 200, body: { family: this.familyInfo(), me } };
+    }
+    if (verb === "GET" && path === "/instance") {
+      return { status: 200, body: {
+        join_policy: this.instanceJoinPolicy(),
+        member_count: this.sql.exec(`SELECT COUNT(*) AS n FROM members WHERE status = 'active'`).toArray()[0].n,
+        me: { member_pub: me.member_pub, role: me.role, status: me.status, handle: me.handle || null },
+      } };
+    }
+    if (verb === "POST" && path === "/register") {
+      // Reached when an already-registered member re-posts; update handle.
+      if (data.handle) this.sql.exec(`UPDATE members SET handle = ? WHERE member_pub = ?`, sanitizeHandle(data.handle), me.member_pub);
+      return { status: 200, body: { ok: true, me: { member_pub: me.member_pub, role: me.role, status: me.status, handle: this.getMember(me.member_pub).handle || null } } };
     }
     if (verb === "POST" && path === "/join") {
       return { status: 200, body: { ok: true, status: me.status } };
@@ -710,14 +768,22 @@ export class FamilyDO {
       const type = String(data.type || "");
       const rules = GROUP_TYPE_RULES[type];
       if (!rules) return { status: 400, body: { error: "bad_group_type" } };
+      // County boards are the base civic tier and are seeded by an instance
+      // steward, not created ad hoc by members.
+      if (type === "county" && !this.requireAdmin()) return { status: 403, body: { error: "steward_only" } };
+      // Parent hierarchy: lobbies must nest inside an existing county board;
+      // base/group tiers must not have a parent.
+      let parentId = null;
+      if (rules.parentType) {
+        const parent = this.getGroup(data.parent_group_id);
+        if (!parent || parent.type !== rules.parentType) return { status: 400, body: { error: "bad_parent" } };
+        parentId = parent.id;
+      }
       const encryption_mode = rules.encryption_mode;
-      // Default visibility/join by type; validate any overrides.
-      const visibility = rules.visibilities.has(data.visibility)
-        ? data.visibility
-        : type === "issue" ? "members" : "private";
+      const visibility = rules.visibilities.has(data.visibility) ? data.visibility : [...rules.visibilities][0];
       const join_policy = JOIN_POLICIES.has(data.join_policy)
         ? data.join_policy
-        : type === "issue" ? "request" : "invite";
+        : (type === "county" ? "open" : type === "issue" ? "request" : "invite");
       // Name: server-mode groups carry plaintext; e2e groups carry ciphertext.
       const plainName = encryption_mode === "server" ? String(data.name || "").trim() : null;
       const encName = encryption_mode === "e2e" ? data.enc_name || null : null;
@@ -725,9 +791,9 @@ export class FamilyDO {
       const id = uid("g");
       const now = new Date().toISOString();
       this.sql.exec(
-        `INSERT INTO groups (id, type, slug, enc_name, name, visibility, join_policy, encryption_mode, current_epoch, founding, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)`,
-        id, type, slugify(data.slug || plainName || type), encName ? JSON.stringify(encName) : null,
+        `INSERT INTO groups (id, type, parent_group_id, slug, enc_name, name, visibility, join_policy, encryption_mode, current_epoch, founding, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)`,
+        id, type, parentId, slugify(data.slug || plainName || type), encName ? JSON.stringify(encName) : null,
         plainName, visibility, join_policy, encryption_mode, me.member_pub, now
       );
       // Creator becomes the group's steward.
@@ -737,10 +803,40 @@ export class FamilyDO {
       );
       return { status: 200, body: { ok: true, group: this.groupInfo(this.getGroup(id), me.member_pub) } };
     }
+    // Seed the base county boards from a config-supplied list (idempotent by
+    // slug). Instance-steward only. The county names come from instance.js.
+    if (verb === "POST" && path === "/counties/seed") {
+      if (!this.requireAdmin()) return { status: 403, body: { error: "steward_only" } };
+      const names = Array.isArray(data.counties) ? data.counties : [];
+      const now = new Date().toISOString();
+      let created = 0;
+      for (const raw of names) {
+        const nm = String(raw || "").trim();
+        if (!nm) continue;
+        const slug = slugify(nm);
+        const exists = this.sql.exec(`SELECT 1 FROM groups WHERE type = 'county' AND slug = ?`, slug).toArray()[0];
+        if (exists) continue;
+        const gid = uid("g");
+        this.sql.exec(
+          `INSERT INTO groups (id, type, parent_group_id, slug, enc_name, name, visibility, join_policy, encryption_mode, current_epoch, founding, created_by, created_at)
+           VALUES (?, 'county', NULL, ?, NULL, ?, 'public_read', 'open', 'server', 1, 0, ?, ?)`,
+          gid, slug, nm, me.member_pub, now
+        );
+        // The seeding steward is the initial steward of each county board.
+        this.sql.exec(
+          `INSERT INTO group_members (group_id, member_pub, role, status, joined_at) VALUES (?, ?, 'steward', 'active', ?)`,
+          gid, me.member_pub, now
+        );
+        created++;
+      }
+      const total = this.sql.exec(`SELECT COUNT(*) AS n FROM groups WHERE type = 'county'`).toArray()[0].n;
+      return { status: 200, body: { ok: true, created, total } };
+    }
     if (verb === "LIST" && path === "/groups") {
-      const rows = this.sql.exec(`SELECT * FROM groups ORDER BY founding DESC, created_at`).toArray()
-        .map((g) => this.groupInfo(g, me.member_pub));
-      return { status: 200, body: { rows } };
+      let rows = this.sql.exec(`SELECT * FROM groups ORDER BY founding DESC, type, created_at`).toArray();
+      if (data.type && GROUP_TYPE_RULES[data.type]) rows = rows.filter((g) => g.type === data.type);
+      if (data.parent_group_id) rows = rows.filter((g) => g.parent_group_id === data.parent_group_id);
+      return { status: 200, body: { rows: rows.map((g) => this.groupInfo(g, me.member_pub)) } };
     }
     if (verb === "GET" && path.startsWith("/groups/") && !path.includes("/", "/groups/".length)) {
       const g = this.getGroup(path.slice("/groups/".length));
@@ -857,6 +953,12 @@ function slugify(s) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 48) || null;
+}
+// Pseudonymous public handle: letters/digits/_/-/space, trimmed, length-capped.
+// Deliberately permissive but never a real-name requirement.
+function sanitizeHandle(s) {
+  const h = String(s || "").trim().replace(/\s+/g, " ").replace(/[^\w \-]/g, "").slice(0, 40);
+  return h.length >= 2 ? h : null;
 }
 function verbOf(payload) {
   return String(payload?.verb || "").toUpperCase();

@@ -39,6 +39,14 @@ export const instance = {
   },
   locale: pick("VITE_INSTANCE_LOCALE", "en-US"),
 
+  // Instance-level signup policy. Pilot = open public signup with a pseudonymous
+  // handle (no real name, no ID). Tighten later ('invite' | 'request' | 'open').
+  signup: {
+    policy: pick("VITE_SIGNUP_POLICY", "open"),
+    requireHandle: true, // pseudonymous handle required; real name never required
+    verifiedHumanProvider: null, // roadmap: 'idme' | 'logingov' (see docs/ROADMAP.md)
+  },
+
   // ---- protocol surface ---------------------------------------------------
   // The binding constraint behind the exclusion list. Rendered on the public
   // transparency page (Phase 2.4) and linked in-app.
@@ -68,6 +76,22 @@ export const instance = {
 // decision on 2026-07-30).
 
 export const GROUP_TYPES = {
+  county: {
+    id: "county",
+    label: "County board",
+    plural: "County boards",
+    description:
+      "The base tier: a public, county-level board for general discussion. Server-readable so it can be public; members create lobbies within it.",
+    encryptionMode: "server",
+    tier: "base", // top-level; parent is always null
+    defaults: {
+      visibility: "public_read",
+      joinPolicy: "open",
+    },
+    allowedVisibilities: ["members", "public_read"],
+    // County boards are seeded from region.counties, not created ad hoc.
+    userCreatable: false,
+  },
   community: {
     id: "community",
     label: "Community",
@@ -87,17 +111,36 @@ export const GROUP_TYPES = {
     label: "Lobby",
     plural: "Lobbies",
     description:
-      "A civilian lobby: deliberate, adopt positions by vote, and route members to their representatives. Server-readable so positions and tallies can be public.",
+      "A civilian lobby nested inside a county board: deliberate, adopt positions by vote, and route members to their representatives. Server-readable so positions and tallies can be public.",
     encryptionMode: "server",
+    tier: "lobby", // nested; parent must be a county board
+    parentType: "county",
     defaults: {
       visibility: "members",
       joinPolicy: "request",
     },
     allowedVisibilities: ["private", "members", "public_read"],
+    userCreatable: true,
   },
 };
 
-export const DEFAULT_GROUP_TYPE = "community";
+export const DEFAULT_GROUP_TYPE = "county";
+
+// Maine's 16 counties — the seed list for the base county boards. Editing this
+// (or VITE overrides for another state) is how you re-scope the instance.
+export const COUNTIES = [
+  "Androscoggin", "Aroostook", "Cumberland", "Franklin", "Hancock", "Kennebec",
+  "Knox", "Lincoln", "Oxford", "Penobscot", "Piscataquis", "Sagadahoc",
+  "Somerset", "Waldo", "Washington", "York",
+];
+
+// External integrations. All roadmap-only and DISABLED — see docs/ROADMAP.md.
+// Do not enable civic.ai without a Protocol review (third-party data flow).
+export const INTEGRATIONS = {
+  polis: { enabled: false, selfHosted: true, status: "roadmap" },
+  civicAi: { enabled: false, status: "blocked_pending_protocol_review" },
+  verifiedHuman: { enabled: false, providers: ["idme", "logingov"], status: "roadmap" },
+};
 
 export const VISIBILITIES = {
   private: { id: "private", label: "Private", description: "Only members can find or read this group." },

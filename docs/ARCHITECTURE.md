@@ -134,43 +134,61 @@ empty-family only) → `createTables()` (`CREATE TABLE IF NOT EXISTS`) → `migr
 ### Group model (Phase 1 — implemented, backend)
 
 `Family → Group` is generalized additively. The DO = one **instance** (the Maine
-Forum). Groups are first-class rows; each has a `type` (`community` | `issue`),
-`visibility`, `join_policy`, and an `encryption_mode`:
+Forum). Groups are first-class rows; each has a `type`, `parent_group_id`,
+`visibility`, `join_policy`, and an `encryption_mode`. There are three types,
+arranged geographically (see `docs/ROADMAP.md`):
 
-- **community** groups are **E2E** (`encryption_mode = e2e`) — server stores
+- **county** — the **base civic tier**: one board per Maine county, **server-readable**
+  (`encryption_mode = server`), `public_read`, open-join, top-level
+  (`parent_group_id = NULL`). Seeded from config, not created ad hoc.
+- **issue** (civilian **lobby**) — **server-readable**, **nested under a county board**
+  (`parent_group_id` → a `county`). Positions, tallies, and moderation can be
+  public. Members create these.
+- **community** — private + **E2E** (`encryption_mode = e2e`); server stores
   ciphertext only; cannot be `public_read` (non-members hold no key).
-- **issue** groups (civilian lobbies) are **server-readable** (`server`) — so
-  positions, tallies, and moderation can be public. May be `public_read`.
 
-The instance's **founding community group** (`groups.founding = 1`) reuses the
-original `members` / `family_keys` / content tables, so the existing E2E family
-flow and its test are unchanged. Additional groups use:
+**Membership tiers.** `members` = instance accounts. **Public signup (pilot):**
+when `family_meta.instance_join_policy = 'open'`, any device may `POST /register`
+with a **pseudonymous `handle`** (no invite, no real name, no ID) and becomes an
+active instance member. Instance membership is decoupled from the private E2E
+**founding community group** (`groups.founding = 1`): a founding-group member
+must hold a wrapped key (`family_keys` row), so public-signup accounts are *not*
+auto-joined to it. The founding group still reuses the original `members` /
+`family_keys` / content tables, so the existing E2E family flow and its test are
+unchanged.
 
 | Table | Key columns |
 |---|---|
-| `groups` | `id` (PK), `type`, `slug`, `enc_name` (e2e) / `name` (server), `visibility`, `join_policy`, `encryption_mode`, `current_epoch`, `founding`, `created_by`, `created_at` |
+| `groups` | `id` (PK), `type` (`county`\|`issue`\|`community`), `parent_group_id`, `slug`, `enc_name` (e2e) / `name` (server), `visibility`, `join_policy`, `encryption_mode`, `current_epoch`, `founding`, `created_by`, `created_at` |
 | `group_members` | (`group_id`,`member_pub`) PK, `role` (`member`\|`moderator`\|`steward`), `status` (`pending`\|`active`), `joined_at` — one membership/vote per group |
+| `members` (+`handle`) | plaintext pseudonymous handle for the public civic layer (never `display_name` — that name triggers the legacy self-heal) |
 
-New RPC verbs (`family-do.js`): `POST /groups`, `LIST /groups`,
-`GET /groups/:id`, `POST /groups/:id/join`, `LIST /groups/:id/members`,
-`LIST /groups/:id/requests`, `POST /groups/:id/admit`, `POST /groups/:id/role`,
-`POST /groups/:id/remove`. Role gates: steward manages membership/roles;
-moderator reviews requests; a last-steward guard prevents orphaning a group.
+New RPC verbs (`family-do.js`): `POST /register` (open signup),
+`GET /instance` (join policy + counts), `POST /counties/seed` (steward,
+idempotent, county list from config), `POST /groups` (county = steward-only;
+issue = requires a valid county parent), `LIST /groups` (filter by `type` /
+`parent_group_id`), `GET /groups/:id`, `POST /groups/:id/join`,
+`LIST /groups/:id/members`, `LIST /groups/:id/requests`,
+`POST /groups/:id/admit`, `POST /groups/:id/role`, `POST /groups/:id/remove`.
+Role gates: steward manages membership/roles; moderator reviews requests; a
+last-steward guard prevents orphaning a group.
 
-Instance-level naming, branding, and all policy defaults live in
-`forum-pod/src/config/instance.js` (ground rule #5). The DO mirrors the
-type/visibility/role enums locally (separate package) and points back to that
-file as the source of truth.
+Instance-level naming, branding, county list (`COUNTIES`), signup policy, and all
+policy defaults live in `forum-pod/src/config/instance.js` (ground rule #5). The
+DO mirrors the type/visibility/role enums locally (separate package) and points
+back to that file as the source of truth.
 
-**Still open in Phase 1:** client/UI generalization (group switcher, strings
-from config, create-lobby UI); per-group content routing for issue groups
-(server-mode posts) is deferred to the lobby-feature phases. **Not yet built
-(later phases):** instance-level open registration/join-policy, Proposal, Poll,
-Report, Position, District codes, transparency page.
+**Still open in Phase 1:** client/UI generalization (config strings, county-board
+browser, create-lobby UI, public-signup screen); per-group content routing for
+server-mode groups (posts on county boards / lobbies) is deferred to the
+lobby-feature phases. **Roadmap (not built):** zk/verified-human (ID.me/Login.gov),
+Pol.is opinion mapping, civic.ai (blocked pending Protocol review). **Not yet built
+(later phases):** Proposal, Poll, Report, Position, District codes, transparency page.
 
-Tests: `forum-pod/scripts/group-model-test.mjs` (Phase 1) and the unchanged
-`forum-pod/scripts/family-e2e-test.mjs` (regression) both pass against a fresh
-local `wrangler dev`.
+Tests (all pass against a fresh local `wrangler dev`):
+`forum-pod/scripts/civic-boards-test.mjs` (county boards + public signup +
+lobbies), `forum-pod/scripts/group-model-test.mjs` (Phase 1 group model), and the
+unchanged `forum-pod/scripts/family-e2e-test.mjs` (E2E regression).
 
 ### Legacy / unwired (forum-stack + cooperative remnants)
 

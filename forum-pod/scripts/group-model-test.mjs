@@ -83,16 +83,20 @@ assert.strictEqual(home.encryption_mode, "e2e");
 assert.strictEqual(home.my_role, "steward", "founder is steward of founding group");
 console.log("[ok] founding community group created; founder is its steward");
 
-// 2. Create an issue (lobby) group — server-mode, public_read, open join.
+// 2. Seed a county board (base tier), then create an issue lobby nested in it.
+await ok(founder, "POST", "/counties/seed", { counties: ["Cumberland"] });
+const county = (await ok(founder, "LIST", "/groups", { type: "county" })).rows[0];
+assert.strictEqual(county.type, "county", "county board seeded");
 const lobby = (await ok(founder, "POST", "/groups", {
-  type: "issue", name: "Ranked-Choice Voting", visibility: "public_read", join_policy: "open",
+  type: "issue", name: "Ranked-Choice Voting", parent_group_id: county.id, visibility: "public_read", join_policy: "open",
 })).group;
 assert.strictEqual(lobby.type, "issue");
 assert.strictEqual(lobby.encryption_mode, "server", "issue groups are server-readable");
 assert.strictEqual(lobby.visibility, "public_read", "issue groups may be public_read");
+assert.strictEqual(lobby.parent_group_id, county.id, "lobby nests under its county");
 assert.strictEqual(lobby.name, "Ranked-Choice Voting", "server-mode group exposes plaintext name");
 assert.strictEqual(lobby.my_role, "steward", "creator is steward");
-console.log("[ok] issue lobby created (server-mode, public_read, creator=steward)");
+console.log("[ok] county board seeded; issue lobby nested under it (server-mode, public_read)");
 
 // 3. Create a community group requesting public_read — must be refused/coerced.
 const priv = (await ok(founder, "POST", "/groups", {
