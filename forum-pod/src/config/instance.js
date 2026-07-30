@@ -142,7 +142,10 @@ export const INTEGRATIONS = {
   // signal, and the server clusters members + surfaces consensus. See the
   // `/groups/:id/opinion-map` endpoint.
   polis: { enabled: true, firstParty: true, status: "implemented" },
-  civicAi: { enabled: false, status: "blocked_pending_protocol_review" },
+  // External integrations. See docs/ROADMAP.md.
+  // Civic AI = Tang/Green governance frame for a *local* constitutional steward —
+  // not a third-party analytics pipeline. See docs/MODERATION.md.
+  civicAi: { enabled: false, role: "local_steward_governance", status: "roadmap" },
   verifiedHuman: { enabled: false, providers: ["idme", "logingov"], status: "roadmap" },
 };
 
@@ -166,13 +169,18 @@ export const OPINION_MAP = {
  */
 export const MODERATION = {
   standard: "first_amendment_aligned",
+  // Adjudicator: AI constitutional gate (no human viewpoint moderators).
+  // Stewards manage membership/structure only. See docs/MODERATION.md.
+  adjudicator: "ai_constitutional_gate",
+  interimHumanHide: true, // steward hide UI until the AI gate ships
   summary:
-    "Lawful speech is welcome — including unpopular or offensive speech. We do not remove posts for viewpoint.",
+    "Lawful speech is welcome — including unpopular or offensive speech. An AI constitutional gate — not human moderators — decides only the narrow unprotected categories.",
   principles: [
     "If it is legal to say under U.S. law, it can be said here.",
     "Authors may edit their own discussion posts and comments.",
-    "Stewards do not rewrite or delete lawful speech for disagreement or offense.",
-    "Hiding is reserved for narrow illegal categories only (true threats, incitement to imminent lawless action, CSAM, fraud, or a binding court order).",
+    "No human content moderators for viewpoint, offense, or disagreement.",
+    "An AI constitutional gate may hide only: true threats, incitement to imminent lawless action, CSAM, fraud, or a binding court order.",
+    "The gate is a local, inspectable steward (Civic AI–shaped) — member text is not exported to a third-party analysis cloud.",
   ],
   hideReasons: [
     { id: "true_threat", label: "True threat" },
@@ -181,6 +189,12 @@ export const MODERATION = {
     { id: "fraud", label: "Fraud / criminal impersonation" },
     { id: "court_order", label: "Binding court order" },
   ],
+  civicAi: {
+    // Audrey Tang / Caroline Green framework — governance patterns, not a SaaS feed.
+    frameworkUrl: "https://civic.ai/",
+    role: "local_steward_governance",
+    status: "roadmap",
+  },
 };
 
 export const VISIBILITIES = {

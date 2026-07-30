@@ -66,19 +66,28 @@ Maine Forum (instance)
 - **Next:** client visualization (scatter of opinion groups + consensus list);
   feed consensus into Phase 2 governance (proposals/polls).
 
-### 3. civic.ai data analysis — ⚠️ PENDING PROTOCOL REVIEW
-- **Goal (as proposed):** use civic.ai for data analysis of civic sentiment.
-- **Concern:** routing member data to a third-party analysis service brushes
-  against multiple Protocol exclusions/commitments: data minimization, no
-  third-party analytics/sharing, no behavioral/psychographic profiling, and
-  "member data is never sold." The Forum's own model is aggregate-only,
-  first-party analysis.
-- **Required before any work:** an explicit decision on (a) what data (if any)
-  leaves the instance, (b) whether analysis can be done on **aggregate,
-  anonymized** data only, and (c) whether civic.ai can be self-hosted or run
-  against opt-in aggregates. Until then this is **not** on the build path and no
-  dependency/code will be added.
-- **Status:** flagged; blocked pending human decision.
+### 3. AI constitutional gate + Civic AI stewardship — ROADMAP
+- **Goal:** automate the only content decisions we allow — whether a
+  post/comment is **outside** First Amendment protection — with **no human
+  viewpoint moderators**. Stewards manage groups; speech adjudication is AI.
+- **Standard:** same narrow categories as `docs/MODERATION.md` (true threat,
+  incitement, CSAM, fraud, court order). Lawful speech stays up.
+- **Civic.AI (Audrey Tang):** use as the **governance frame** for a bounded
+  local steward (inspectable, correctable, switchable) — *not* as a third-party
+  SaaS that receives member corpora for “data analysis.” See
+  [civic.ai](https://civic.ai/) / 6-Pack of Care (speech vs. amplification,
+  alignment by process).
+- **Implementation bias (Protocol-clean):**
+  1. First-party classifier on post/comment create (and edit), with published
+     policy prompt + model id/version.
+  2. Append-only **moderation audit log** (reason, model, content id, time).
+  3. Optional member appeal that re-runs the gate or queues a *process*
+     review — not open-ended human censorship.
+- **Explicitly out of scope:** sentiment profiling, psychographics, selling or
+  exporting feeds to an external “civic analysis” cloud.
+- **Status:** design promoted from earlier “blocked civic.ai data analysis”
+  note; build path is **local constitutional gate first**, Civic AI governance
+  patterns layered on.
 
 ## Relationship to the pivot phases
 
@@ -89,5 +98,6 @@ Maine Forum (instance)
 - verified-human sits in **Phase 3.4** (identity), promoted from this roadmap
   when ready.
 - Pol.is opinion mapping is **implemented first-party** on server-mode groups;
-  its consensus output feeds Phase 2 governance. civic.ai remains blocked
-  pending a Protocol review.
+  its consensus output feeds Phase 2 governance. Moderation adjudication is an
+  **AI constitutional gate** (Civic AI–shaped local steward); not third-party
+  sentiment export.

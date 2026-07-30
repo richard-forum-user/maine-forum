@@ -208,8 +208,9 @@ aggregate views, no behavioral export).
 
 **Still open in Phase 1:** client/UI generalization (config strings, county-board
 browser, create-lobby UI, public-signup screen, opinion-map visualization).
-**Roadmap (not built):** zk/verified-human (ID.me/Login.gov); civic.ai (blocked
-pending Protocol review). Pol.is is now **implemented first-party** (above).
+**Roadmap (not built):** zk/verified-human (ID.me/Login.gov); **AI constitutional
+gate** (Civic AI–shaped local steward for unprotected-speech categories only —
+see `docs/MODERATION.md`). Pol.is is now **implemented first-party** (above).
 **Not yet built (later phases):** Proposal, Poll, Report, Position, District
 codes, transparency page.
 
