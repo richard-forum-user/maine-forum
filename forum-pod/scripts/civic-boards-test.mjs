@@ -83,11 +83,22 @@ assert.strictEqual(seed2.created, 0, "re-seed is idempotent");
 assert.strictEqual(seed2.total, COUNTIES.length, "county board count stable");
 console.log(`[ok] seeded ${seed1.created} county boards; re-seed created 0 (idempotent)`);
 
+// 2b. Pre-signup bootstrap tells a not-yet-member device the instance is open.
+const boot = await ok(citizen, "GET", "/bootstrap");
+assert.strictEqual(boot.founded, true, "bootstrap reports founded");
+assert.strictEqual(boot.join_policy, "open", "bootstrap reports open signup");
+assert.strictEqual(boot.already_member, false, "bootstrap knows caller is not yet a member");
+console.log("[ok] pre-signup bootstrap: founded + open, caller not yet a member");
+
 // 3. Brand-new device self-registers with a pseudonymous handle (no invite).
 const reg = await ok(citizen, "POST", "/register", { handle: "PortlandVoter", x_pub: citizen.xPub });
 assert.strictEqual(reg.me.status, "active", "public signup is immediately active");
 assert.strictEqual(reg.me.handle, "PortlandVoter", "handle stored");
 console.log("[ok] public device self-registered as active member (pseudonymous)");
+
+// 3b. A different device cannot claim the same handle (case-insensitive).
+assert.strictEqual((await rpc(actor(), "POST", "/register", { handle: "portlandVOTER" })).status, 409, "duplicate handle rejected");
+console.log("[ok] duplicate handle (case-insensitive) rejected with 409");
 
 // 4. Public member lists county boards.
 const counties = (await ok(citizen, "LIST", "/groups", { type: "county" })).rows;

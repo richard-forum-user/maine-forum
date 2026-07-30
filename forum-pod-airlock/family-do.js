@@ -420,20 +420,28 @@ export class FamilyDO {
    * No real name, no invite, no ID. Server-readable civic layer only — this does
    * NOT grant membership in the private E2E founding group (that needs a key).
    */
+  handleTaken(handle, exceptPub) {
+    return !!this.sql.exec(
+      `SELECT 1 FROM members WHERE handle IS NOT NULL AND LOWER(handle) = LOWER(?) AND member_pub != ? LIMIT 1`,
+      handle, exceptPub || ""
+    ).toArray()[0];
+  }
+  /** Result: 'ok' | 'taken' | 'bad_handle' | null (not an open-signup attempt). */
   async tryRegister(payload, pub) {
-    if (!payload || payload.verb !== "POST" || payload.path !== "/register") return false;
-    if (this.memberCount() === 0) return false; // instance must be founded first
-    if (this.instanceJoinPolicy() !== "open") return false;
+    if (!payload || payload.verb !== "POST" || payload.path !== "/register") return null;
+    if (this.memberCount() === 0) return null; // instance must be founded first
+    if (this.instanceJoinPolicy() !== "open") return null;
     const data = payload.data || {};
     const handle = sanitizeHandle(data.handle);
-    if (!handle) return false;
+    if (!handle) return "bad_handle";
+    if (this.handleTaken(handle, pub)) return "taken";
     const now = new Date().toISOString();
     this.sql.exec(
       `INSERT INTO members (member_pub, x_pub, role, status, handle, joined_at) VALUES (?, ?, 'member', 'active', ?, ?)
        ON CONFLICT(member_pub) DO UPDATE SET handle = excluded.handle`,
       pub, data.x_pub || null, handle, now
     );
-    return true;
+    return "ok";
   }
 
   // ---- fetch / auth ------------------------------------------------------
@@ -470,6 +478,18 @@ export class FamilyDO {
       return jsonResp(200, { token: JSON.parse(row.token) });
     }
 
+    // Public pre-signup bootstrap: lets the landing screen decide Found vs Sign
+    // up vs Browse without being a member yet. No secrets, aggregate counts only.
+    if (verbOf(payload) === "GET" && pathOf(payload) === "/bootstrap") {
+      const founded = this.memberCount() > 0;
+      return jsonResp(200, {
+        founded,
+        join_policy: founded ? this.instanceJoinPolicy() : null,
+        member_count: this.sql.exec(`SELECT COUNT(*) AS n FROM members WHERE status = 'active'`).toArray()[0].n,
+        already_member: !!this.getMember(publicKeyHex),
+      });
+    }
+
     if (!this.getMember(publicKeyHex)) {
       const isFounding = this.memberCount() === 0;
       if (isFounding && payload?.verb === "PROVISION") {
@@ -480,14 +500,19 @@ export class FamilyDO {
         );
         this.setMeta("created_at", now);
         this.setMeta("current_epoch", "1");
-      } else if (await this.tryRegister(payload, publicKeyHex)) {
-        // self-registered as an active instance member (open signup)
-      } else if (await this.tryJoinWithInvite(payload, publicKeyHex)) {
-        // enrolled as pending
-      } else if (isFounding) {
-        return jsonResp(404, { error: "family_not_created" });
       } else {
-        return jsonResp(403, { error: "not_a_member" });
+        const reg = await this.tryRegister(payload, publicKeyHex);
+        if (reg === "taken") return jsonResp(409, { error: "handle_taken" });
+        if (reg === "bad_handle") return jsonResp(400, { error: "bad_handle" });
+        if (reg === "ok") {
+          // self-registered as an active instance member (open signup)
+        } else if (await this.tryJoinWithInvite(payload, publicKeyHex)) {
+          // enrolled as pending
+        } else if (isFounding) {
+          return jsonResp(404, { error: "family_not_created" });
+        } else {
+          return jsonResp(403, { error: "not_a_member" });
+        }
       }
     }
     this._me = this.getMember(publicKeyHex);
@@ -548,7 +573,10 @@ export class FamilyDO {
       if (INSTANCE_JOIN_POLICIES.has(data.instance_join_policy)) {
         this.setMeta("instance_join_policy", data.instance_join_policy);
       }
-      if (data.handle) this.sql.exec(`UPDATE members SET handle = ? WHERE member_pub = ?`, sanitizeHandle(data.handle), me.member_pub);
+      if (data.handle) {
+        const h = sanitizeHandle(data.handle);
+        if (h && !this.handleTaken(h, me.member_pub)) this.sql.exec(`UPDATE members SET handle = ? WHERE member_pub = ?`, h, me.member_pub);
+      }
       return { status: 200, body: { ok: true, family: this.familyInfo(), me: this.getMember(me.member_pub) } };
     }
     if (verb === "GET" && path === "/family") {
@@ -563,7 +591,12 @@ export class FamilyDO {
     }
     if (verb === "POST" && path === "/register") {
       // Reached when an already-registered member re-posts; update handle.
-      if (data.handle) this.sql.exec(`UPDATE members SET handle = ? WHERE member_pub = ?`, sanitizeHandle(data.handle), me.member_pub);
+      if (data.handle) {
+        const h = sanitizeHandle(data.handle);
+        if (!h) return { status: 400, body: { error: "bad_handle" } };
+        if (this.handleTaken(h, me.member_pub)) return { status: 409, body: { error: "handle_taken" } };
+        this.sql.exec(`UPDATE members SET handle = ? WHERE member_pub = ?`, h, me.member_pub);
+      }
       return { status: 200, body: { ok: true, me: { member_pub: me.member_pub, role: me.role, status: me.status, handle: this.getMember(me.member_pub).handle || null } } };
     }
     if (verb === "POST" && path === "/join") {
