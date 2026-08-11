@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback } from "react";
 import { styles as s, t } from "../ui/theme.js";
 import { opinionMap } from "./civic-client.js";
+import { hideTallies, LABELS } from "../config/numbers-discipline.js";
 
 const CLUSTER_COLORS = ["#1f6b56", "#c45c26", "#3a6ea5", "#7a5cbf", "#b23a48"];
 const groupLabel = (c) => `Opinion Group ${String.fromCharCode(65 + c)}`;
@@ -69,7 +70,7 @@ function StatementRow({ st, groupsCount }) {
   );
 }
 
-export default function OpinionMap({ groupId }) {
+export default function OpinionMap({ groupId, windowStatus = "open" }) {
   const [map, setMap] = useState(null);
   const [err, setErr] = useState("");
   const [loading, setLoading] = useState(true);
@@ -96,6 +97,34 @@ export default function OpinionMap({ groupId }) {
 
   const groupsCount = map.opinion_groups.length;
   const divisive = map.statements.filter((x) => x.divisive).sort((a, b) => b.votes - a.votes);
+  const statements = map.statements || [];
+
+  if (hideTallies(windowStatus)) {
+    const texts = statements.filter((st) => st.text);
+    return (
+      <div className="mf-fade-in" style={{ display: "grid", gap: 16 }}>
+        <div style={{ ...s.card, display: "grid", gap: 10 }}>
+          <div style={{ fontFamily: t.display, fontWeight: 700, fontSize: 17 }}>Opinion map</div>
+          <p style={{ margin: 0, fontSize: 14, color: t.dim, lineHeight: 1.5 }}>{LABELS.opinionMapOpen}</p>
+        </div>
+        <div style={s.card}>
+          <div style={{ fontFamily: t.display, fontWeight: 700, fontSize: 16, marginBottom: 8 }}>
+            Arguments in play
+          </div>
+          {texts.length ? texts.map((st) => (
+            <div
+              key={`${st.item_type}:${st.item_id}`}
+              style={{ padding: "12px 0", borderBottom: `1px solid ${t.border}`, fontSize: 15, lineHeight: 1.45 }}
+            >
+              {st.text}
+            </div>
+          )) : (
+            <div style={{ color: t.faint, fontSize: 14 }}>No visible statements yet.</div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="mf-fade-in" style={{ display: "grid", gap: 16 }}>
