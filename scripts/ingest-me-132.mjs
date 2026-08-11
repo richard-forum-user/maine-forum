@@ -70,7 +70,7 @@ async function applyPosts(plan) {
       errors.push({ batch: i, status: res.status, error: body?.error || res.statusText });
       continue;
     }
-    written += body.upserted || 0;
+    written += body.count ?? body.upserted ?? 0;
     summaryFail += body.summaries_failed || 0;
     errors.push(...(body.errors || []));
     process.stderr.write(`applied ${Math.min(i + batch.length, posts.length)}/${posts.length}\n`);
