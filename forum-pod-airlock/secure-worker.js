@@ -17,6 +17,8 @@ import { checkRateLimit, clientIp } from './rate-limit.js';
 import { checkPodWriteBudget, podBodyTooLarge } from './do-guards.js';
 import { handleWebAuthnRoute } from './webauthn-server.js';
 import { handleInboxRoute, recordPodOwner } from './inbox-routes.js';
+import { handlePublicHtml } from './public-read.js';
+import { matchPublicRoute } from './public-access.js';
 
 const POD_API_PREFIX = '/api/pod';
 const INBOX_PREFIX = '/api/inbox';
@@ -222,6 +224,90 @@ export default {
 
     if (url.pathname === '/' && request.method === 'GET') {
       return Response.redirect(`${url.origin}/pod`, 302);
+    }
+
+    // Gated ingest — live before --apply. Not a public GET (not in matchPublicRoute).
+    // FamilyDO: POST + X-Internal-Ingest:1 → ingestLegislationBatch → insertLegislationPost
+    // (family-do.js 160–232, 234–272, 954–961). Pathname is not routed; header is.
+    if (url.pathname === '/ingest' && request.method === 'POST') {
+      const expected = env.INGEST_TOKEN;
+      const auth = request.headers.get('Authorization') || '';
+      const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+      if (!expected || bearer !== expected) {
+        return jsonResponse({ error: 'unauthorized' }, 401);
+      }
+      const rl = await applyIngressRateLimit(request, env, 'ingest', 30, 60_000);
+      if (rl) return rl;
+      if (!env.FAMILY) return jsonResponse({ error: 'family_do_not_bound' }, 500);
+      const payload = await request.json().catch(() => null);
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+          || (payload.posts != null && !Array.isArray(payload.posts))) {
+        return jsonResponse({ error: 'malformed_payload' }, 422);
+      }
+      const id = env.FAMILY.idFromName('family-space-v2');
+      const upstream = await env.FAMILY.get(id).fetch(new Request('https://family.internal/ingest/legislation', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Internal-Ingest': '1' },
+        body: JSON.stringify(payload),
+      }));
+      const report = await upstream.json().catch(() => null);
+      if (!upstream.ok || !report) {
+        return jsonResponse({ error: 'ingest_failed' }, upstream.status >= 400 ? upstream.status : 502);
+      }
+      const count = Number(report.posts_written ?? report.upserted ?? 0);
+      return jsonResponse({ ok: true, count }, 200);
+    }
+
+    if (request.method === 'GET' || request.method === 'HEAD') {
+      if (matchPublicRoute(url.pathname)) {
+        const pubRl = await applyIngressRateLimit(request, env, 'public_html', 180, 60_000);
+        if (pubRl) return pubRl;
+        const publicPage = await handlePublicHtml(request, env);
+        if (publicPage) return publicPage;
+      }
+    }
+
+    if ((url.pathname === '/error-log' || url.pathname === '/api/error-report') && request.method === 'POST') {
+      const pubRl = await applyIngressRateLimit(request, env, 'error_report', 20, 60_000);
+      if (pubRl) return pubRl;
+      const ct = request.headers.get('content-type') || '';
+      let item_id = '';
+      let note = '';
+      if (ct.includes('application/json')) {
+        const body = await request.json().catch(() => ({}));
+        item_id = String(body.item_id || body.postId || body.post_id || '');
+        note = String(body.description || body.note || '');
+      } else {
+        const text = await request.text();
+        const params = new URLSearchParams(text);
+        item_id = params.get('item_id') || params.get('postId') || params.get('post_id') || '';
+        note = params.get('description') || params.get('note') || '';
+      }
+      if (!String(note).trim()) {
+        return Response.redirect(`${url.origin}/error-log?error=1`, 303);
+      }
+      if (env.FAMILY) {
+        const id = env.FAMILY.idFromName('family-space-v2');
+        await env.FAMILY.get(id).fetch(new Request('https://family.internal/public/error-reports', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ item_id, note }),
+        }));
+      }
+      return Response.redirect(`${url.origin}/error-log?queued=1`, 303);
+    }
+
+    // Hub doc shortcuts (consolidate theforum.community paths onto this origin).
+    if (request.method === 'GET') {
+      const docRedirects = {
+        '/about': '/pod/about',
+        '/charter': '/pod/charter',
+        '/lobby-charter': '/pod/charter',
+        '/proposed-articles-of-incorporation': '/pod/charter',
+        '/proposed-articles-of-incorporation/': '/pod/charter',
+      };
+      const dest = docRedirects[url.pathname];
+      if (dest) return Response.redirect(`${url.origin}${dest}`, 302);
     }
 
     if (url.pathname === '/.well-known/security.txt' && request.method === 'GET') {
