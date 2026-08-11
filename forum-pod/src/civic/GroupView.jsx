@@ -26,18 +26,18 @@ function VoteBar({ gid, itemType, itemId, likes, dislikes, myVote, onChanged }) 
         disabled={busy}
         onClick={() => cast(1)}
         aria-pressed={myVote === 1}
-        aria-label="Agree"
+        aria-label={myVote === 1 ? "Agree (your stance)" : "Agree"}
       >
-        Agree · {likes}
+        Agree
       </button>
       <button
         className={`mf-vote mf-vote--down${myVote === -1 ? " mf-vote--on" : ""}`}
         disabled={busy}
         onClick={() => cast(-1)}
         aria-pressed={myVote === -1}
-        aria-label="Disagree"
+        aria-label={myVote === -1 ? "Disagree (your stance)" : "Disagree"}
       >
-        Disagree · {dislikes}
+        Disagree
       </button>
     </div>
   );

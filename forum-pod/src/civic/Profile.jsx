@@ -34,7 +34,7 @@ export default function Profile({ memberPub, onOpenGroup, onBack }) {
   const TABS = [
     ["posts", `Posts (${profile.counts.posts})`],
     ["comments", `Comments (${profile.counts.comments})`],
-    ["votes", `Agreed / disagreed (${profile.counts.agrees + profile.counts.disagrees})`],
+    ["votes", "Agreed / disagreed"],
     ["groups", `Lobbies & boards (${profile.counts.groups})`],
   ];
 
@@ -94,9 +94,6 @@ export default function Profile({ memberPub, onOpenGroup, onBack }) {
                 {p.edited_at ? " · edited" : ""}
               </div>
               <div style={{ marginTop: 4, whiteSpace: "pre-wrap" }}>{p.text}</div>
-              <div style={{ marginTop: 6, fontSize: 12, color: t.faint }}>
-                {p.likes} agree · {p.dislikes} disagree
-              </div>
             </button>
           ))}
         </Section>
