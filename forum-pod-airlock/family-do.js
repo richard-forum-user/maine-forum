@@ -16,6 +16,13 @@
  */
 
 import { verifySignedBundle } from "./pod-signing-web.js";
+import { publicBills, publicBillDetail } from "./public-read.js";
+import {
+  PLATFORM_AUTHOR_PUB,
+  legislationEnabled,
+  sessionForPack,
+  LEGISLATION_EVENT_TYPES,
+} from "./legislation.js";
 
 const REPLAY_WINDOW_MS = 5 * 60 * 1000;
 const REPLAY_CLEANUP_GRACE_MS = 60 * 1000;
@@ -33,6 +40,7 @@ const GROUP_TYPE_RULES = {
   issue: { encryption_mode: "server", visibilities: new Set(["private", "members", "public_read"]), tier: "lobby", parentType: "county" },
   // community groups are private + end-to-end encrypted (family-style).
   community: { encryption_mode: "e2e", visibilities: new Set(["private", "members"]), tier: "group", parentType: null },
+  legislation: { encryption_mode: "server", visibilities: new Set(["members", "public_read"]), tier: "legislation", parentType: "county" },
 };
 const JOIN_POLICIES = new Set(["invite", "request", "open"]);
 const INSTANCE_JOIN_POLICIES = new Set(["invite", "open"]);
@@ -49,6 +57,218 @@ export class FamilyDO {
     this.reconcileLegacySchema();
     this.createTables();
     this.migrate();
+    try {
+      this.ensureLegislationBoard(this.sql.exec(`SELECT * FROM groups WHERE type = 'county' ORDER BY created_at LIMIT 1`).toArray()[0] || null);
+    } catch { /* groups table may be mid-migrate */ }
+  }
+
+  /** One public_read session board (Maine only). Parent is statewide if present, else first county. */
+  ensureLegislationBoard(parent) {
+    if (!legislationEnabled(this.env?.INSTANCE_PACK || "me")) return null;
+    const session = sessionForPack(this.env?.INSTANCE_PACK || "me");
+    if (!session) return null;
+    let board = this.sql.exec(
+      `SELECT * FROM groups WHERE type = 'legislation' ORDER BY created_at LIMIT 1`
+    ).toArray()[0];
+    const now = new Date().toISOString();
+    const parentId = parent?.id || null;
+    if (!board) {
+      if (!parentId) return null;
+      const id = uid("g");
+      this.sql.exec(
+        `INSERT INTO groups (id, type, parent_group_id, slug, enc_name, name, visibility, join_policy, encryption_mode, current_epoch, founding, created_by, created_at)
+         VALUES (?, 'legislation', ?, ?, NULL, ?, 'public_read', 'open', 'server', 1, 0, ?, ?)`,
+        id, parentId, session.boardSlug, session.boardName, PLATFORM_AUTHOR_PUB, now
+      );
+      board = this.sql.exec(`SELECT * FROM groups WHERE id = ?`, id).toArray()[0];
+    }
+    return board;
+  }
+
+  /**
+   * Phase 3 ingest. Idempotent on bill_id. Same/newer snapshot updates in place.
+   * Not a member compose path.
+   */
+  insertLegislationPost(p) {
+    const eventType = p.event_type || p.eventType;
+    if (!LEGISLATION_EVENT_TYPES.has(eventType)) {
+      return { ok: false, error: "bad_event_type" };
+    }
+    const parent = this.sql.exec(`SELECT * FROM groups WHERE type = 'county' ORDER BY created_at LIMIT 1`).toArray()[0];
+    const board = this.ensureLegislationBoard(parent) || this.sql.exec(
+      `SELECT * FROM groups WHERE type = 'legislation' ORDER BY created_at LIMIT 1`
+    ).toArray()[0];
+    if (!board) return { ok: false, error: "legislation_board_missing" };
+    const billId = String(p.bill_id || "").trim();
+    if (!billId) return { ok: false, error: "bill_id_required" };
+    const body = String(p.text || `${p.bill_number || p.billNumber || ""} — ${p.bill_title || p.billTitle || p.title || ""}`).trim().slice(0, 800);
+    if (!body) return { ok: false, error: "text_required" };
+    const eventDate = p.event_date || p.disposition_date || "";
+    const created = /^\d{4}-\d{2}-\d{2}/.test(eventDate)
+      ? `${eventDate.slice(0, 10)}T12:00:00.000Z`
+      : new Date().toISOString();
+    const existing = this.sql.exec(
+      `SELECT id FROM group_posts WHERE source = 'legislation' AND bill_id = ? LIMIT 1`,
+      billId
+    ).toArray()[0];
+    const fields = {
+      text: body,
+      bill_number: String(p.bill_number || p.billNumber || "").trim().slice(0, 40) || null,
+      bill_title: String(p.bill_title || p.billTitle || p.title || "").trim().slice(0, 400) || null,
+      event_type: eventType,
+      session_key: p.session_key || sessionForPack(this.env?.INSTANCE_PACK || "me")?.sessionKey || "me-132",
+      snapshot_date: p.snapshot_date || null,
+      disposition: p.disposition || null,
+      disposition_date: p.disposition_date || null,
+      sponsors_json: JSON.stringify(p.sponsors || []),
+      summary: p.summary || null,
+      summary_model: p.summary_model || null,
+      summary_version: p.summary_version || null,
+      source_url: p.source_url || null,
+      legiscan_url: p.legiscan_url || null,
+      timeline_json: JSON.stringify(p.timeline || []),
+      window_status: "frozen",
+      attribution: p.attribution || null,
+      created_at: created,
+    };
+    if (existing) {
+      this.sql.exec(
+        `UPDATE group_posts SET text=?, bill_number=?, bill_title=?, event_type=?, session_key=?,
+         snapshot_date=?, disposition=?, disposition_date=?, sponsors_json=?, summary=?, summary_model=?,
+         summary_version=?, source_url=?, legiscan_url=?, timeline_json=?, window_status=?, attribution=?, created_at=?
+         WHERE id=?`,
+        fields.text, fields.bill_number, fields.bill_title, fields.event_type, fields.session_key,
+        fields.snapshot_date, fields.disposition, fields.disposition_date, fields.sponsors_json,
+        fields.summary, fields.summary_model, fields.summary_version, fields.source_url,
+        fields.legiscan_url, fields.timeline_json, fields.window_status, fields.attribution,
+        fields.created_at, existing.id
+      );
+      return { ok: true, id: existing.id, group_id: board.id, updated: true };
+    }
+    const id = uid("gp");
+    this.sql.exec(
+      `INSERT INTO group_posts (
+         id, group_id, author_pub, text, status, created_at, source, bill_number, bill_title,
+         event_type, session_key, bill_id, snapshot_date, disposition, disposition_date,
+         sponsors_json, summary, summary_model, summary_version, source_url, legiscan_url,
+         timeline_json, window_status, attribution
+       ) VALUES (?, ?, ?, ?, 'visible', ?, 'legislation', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, board.id, PLATFORM_AUTHOR_PUB, fields.text, fields.created_at,
+      fields.bill_number, fields.bill_title, fields.event_type, fields.session_key,
+      billId, fields.snapshot_date, fields.disposition, fields.disposition_date,
+      fields.sponsors_json, fields.summary, fields.summary_model, fields.summary_version,
+      fields.source_url, fields.legiscan_url, fields.timeline_json, fields.window_status,
+      fields.attribution
+    );
+    return { ok: true, id, group_id: board.id, updated: false };
+  }
+
+  async ingestLegislationBatch(payload) {
+    const posts = Array.isArray(payload?.posts) ? payload.posts : [];
+    let upserted = 0;
+    let summaries_failed = 0;
+    const errors = [];
+    for (const p of posts) {
+      try {
+        const next = { ...p };
+        if (payload.generate_summaries && !next.summary) {
+          const s = await this.summarizeLegislationPost(next);
+          if (s) {
+            next.summary = s.text;
+            next.summary_model = s.model;
+            next.summary_version = s.version;
+          } else {
+            summaries_failed += 1;
+          }
+        }
+        const r = this.insertLegislationPost(next);
+        if (!r.ok) errors.push({ bill_id: p.bill_id, error: r.error });
+        else upserted += 1;
+      } catch (e) {
+        errors.push({ bill_id: p.bill_id, error: e?.message || String(e) });
+      }
+    }
+    const report = {
+      snapshot_key: payload.snapshot_key || null,
+      snapshot_date: payload.snapshot_date || null,
+      row_counts: payload.row_counts || null,
+      posts_written: upserted,
+      summaries_failed,
+      errors,
+      last_run: new Date().toISOString(),
+    };
+    this.setMeta("legislation_ingest_report", JSON.stringify(report));
+    this.setMeta("legislation_ingest_snapshot", payload.snapshot_date || payload.snapshot_key || "");
+    this.setMeta("legislation_ingest_last_run", report.last_run);
+    return report;
+  }
+
+  async summarizeLegislationPost(p) {
+    const ai = this.env?.AI;
+    if (!ai || typeof ai.run !== "function") return null;
+    const model = "@cf/meta/llama-3.1-8b-instruct";
+    const facts = {
+      bill_number: p.bill_number,
+      title: p.bill_title || p.title,
+      description: String(p.description || "").slice(0, 800),
+      disposition: p.disposition,
+      disposition_date: p.disposition_date,
+      sponsors: (p.sponsors || []).map((s) => s.label || s).slice(0, 6),
+    };
+    try {
+      const result = await ai.run(model, {
+        messages: [
+          {
+            role: "system",
+            content:
+              "Write at most 3 plain-language sentences about this Maine bill using only the JSON facts. No advocacy, no prediction, no party characterization. If a field is missing, omit it.",
+          },
+          { role: "user", content: JSON.stringify(facts) },
+        ],
+        max_tokens: 220,
+      });
+      const text = String(result?.response || result?.result || "").trim();
+      if (!text) return null;
+      const sentences = text.split(/(?<=[.!?])\s+/).filter(Boolean).slice(0, 3);
+      return { text: sentences.join(" "), model, version: "ingest-v1" };
+    } catch {
+      return null;
+    }
+  }
+
+  createErrorReport({ item_id, note, source_url }) {
+    const post = item_id
+      ? this.sql.exec(
+        `SELECT id, bill_id, bill_number, summary, source_url FROM group_posts WHERE id = ? OR bill_id = ? OR bill_number = ? LIMIT 1`,
+        item_id, item_id, item_id
+      ).toArray()[0]
+      : null;
+    const id = uid("err");
+    const now = new Date().toISOString();
+    this.sql.exec(
+      `INSERT INTO error_reports (id, created_at, status, item_type, item_id, bill_id, bill_number, note, source_url, summary_excerpt)
+       VALUES (?, ?, 'queued', 'legislation_summary', ?, ?, ?, ?, ?, ?)`,
+      id, now,
+      post?.id || item_id || null,
+      post?.bill_id || null,
+      post?.bill_number || null,
+      String(note || "").trim().slice(0, 1000) || null,
+      source_url || post?.source_url || null,
+      post?.summary ? String(post.summary).slice(0, 280) : null
+    );
+    return { id, status: "queued" };
+  }
+
+  publicErrorLog() {
+    try {
+      return this.sql.exec(
+        `SELECT id, created_at, status, bill_number, item_id, triaged_at
+         FROM error_reports WHERE status IN ('open','corrected')
+         ORDER BY created_at DESC LIMIT 100`
+      ).toArray();
+    } catch {
+      return [];
+    }
   }
 
   createTables() {
@@ -176,6 +396,20 @@ export class FamilyDO {
         created_at TEXT NOT NULL,
         PRIMARY KEY (item_type, item_id, member_pub)
       );
+      CREATE TABLE IF NOT EXISTS error_reports (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued',
+        item_type TEXT NOT NULL DEFAULT 'legislation_summary',
+        item_id TEXT,
+        bill_id TEXT,
+        bill_number TEXT,
+        note TEXT,
+        source_url TEXT,
+        summary_excerpt TEXT,
+        triaged_at TEXT,
+        triaged_by TEXT
+      );
     `);
   }
 
@@ -244,6 +478,24 @@ export class FamilyDO {
       ["groups", "parent_group_id", "TEXT"], // lobbies nest under a county board
       ["group_posts", "edited_at", "TEXT"],
       ["group_comments", "edited_at", "TEXT"],
+      ["group_posts", "source", "TEXT DEFAULT 'member'"],
+      ["group_posts", "bill_number", "TEXT"],
+      ["group_posts", "bill_title", "TEXT"],
+      ["group_posts", "event_type", "TEXT"],
+      ["group_posts", "session_key", "TEXT"],
+      ["group_posts", "bill_id", "TEXT"],
+      ["group_posts", "snapshot_date", "TEXT"],
+      ["group_posts", "disposition", "TEXT"],
+      ["group_posts", "disposition_date", "TEXT"],
+      ["group_posts", "sponsors_json", "TEXT"],
+      ["group_posts", "summary", "TEXT"],
+      ["group_posts", "summary_model", "TEXT"],
+      ["group_posts", "summary_version", "TEXT"],
+      ["group_posts", "source_url", "TEXT"],
+      ["group_posts", "legiscan_url", "TEXT"],
+      ["group_posts", "timeline_json", "TEXT"],
+      ["group_posts", "window_status", "TEXT"],
+      ["group_posts", "attribution", "TEXT"],
       // Future columns go here as ["table", "column", "TYPE ...DEFAULT..."].
     ];
     for (const [table, column, type] of additions) {
@@ -450,8 +702,52 @@ export class FamilyDO {
 
   // ---- fetch / auth ------------------------------------------------------
 
+  handlePublicGet(url) {
+    try {
+      if (url.pathname === "/public/bills") {
+        return jsonResp(200, publicBills(this.sql));
+      }
+      const b = url.pathname.match(/^\/public\/bills\/([^/]+)$/);
+      if (b) {
+        const bill = publicBillDetail(this.sql, decodeURIComponent(b[1]));
+        if (!bill) return jsonResp(404, { error: "not_found" });
+        return jsonResp(200, bill);
+      }
+      if (url.pathname === "/public/error-reports") {
+        return jsonResp(200, { rows: this.publicErrorLog() });
+      }
+    } catch (e) {
+      return jsonResp(500, { error: "public_read_failed", reason: e?.message || String(e) });
+    }
+    return null;
+  }
+
   async fetch(request) {
     await this._ready;
+    if (request.method === "GET") {
+      const pub = this.handlePublicGet(new URL(request.url));
+      if (pub) return pub;
+      return jsonResp(405, { error: "use_post" });
+    }
+    if (request.method === "POST" &&
+        request.headers.get("X-Internal-Ingest") === "1" &&
+        new URL(request.url).pathname === "/ingest/legislation") {
+      try {
+        const payload = await request.json();
+        const report = await this.ingestLegislationBatch(payload || {});
+        return jsonResp(200, { ok: true, ...report, upserted: report.posts_written });
+      } catch (e) {
+        return jsonResp(500, { error: "ingest_failed", reason: e?.message || String(e) });
+      }
+    }
+    if (request.method === "POST" && new URL(request.url).pathname === "/public/error-reports") {
+      try {
+        const payload = await request.json();
+        return jsonResp(200, { ok: true, ...this.createErrorReport(payload || {}) });
+      } catch (e) {
+        return jsonResp(500, { error: "error_report_failed", reason: e?.message || String(e) });
+      }
+    }
     if (request.method !== "POST") return jsonResp(405, { error: "use_post" });
 
     let bundle;
