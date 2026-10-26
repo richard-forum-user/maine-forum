@@ -12,8 +12,9 @@
  */
 
 import { mnemonicToSeedSync } from "@scure/bip39";
-import { sha256 } from "@noble/hashes/sha2.js";
 import {
+  deriveHandle,
+  isKeyHex,
   ed25519KeyPairFromSeed,
   x25519KeyPairFromSeed,
   bytesToHex,
@@ -25,11 +26,6 @@ import {
 const IDENTITY_PUBLIC_KEY = "podlink.identity";
 const IDENTITY_SECRET_KEY = "podlink.identity.secret";
 export const INVITE_PREFIX = "podlink://contact/";
-
-function deriveHandle(edPublicKeyHex) {
-  const digest = sha256(hexToBytes(edPublicKeyHex));
-  return `pk-${bytesToHex(digest).slice(0, 16)}`;
-}
 
 function rootSeed(phrase) {
   return mnemonicToSeedSync(phrase).slice(0, 32);
@@ -134,6 +130,12 @@ export function decodeInvite(text) {
   }
   if (!card?.handle || !card?.ed || !card?.x) {
     throw new Error("Invite is missing required identity fields.");
+  }
+  if (!isKeyHex(card.ed) || !isKeyHex(card.x)) {
+    throw new Error("Invite contains malformed keys.");
+  }
+  if (card.handle !== deriveHandle(card.ed)) {
+    throw new Error("Invite handle does not match its signing key. Do not add this contact.");
   }
   if (!card.podUrl) {
     throw new Error("Invite is missing the contact's pod URL.");

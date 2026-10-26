@@ -21,6 +21,7 @@ import {
   sealEnvelope,
   openDmEnvelope,
   openGroupEnvelope,
+  senderHandleBound,
   randomGroupKey,
   canonical,
   bytesToHex,
@@ -195,15 +196,35 @@ function loadGroupKeys() {
   }
 }
 
-function saveGroupKey(groupId, rawKeyB64) {
+/**
+ * Group key records. Legacy entries are a bare base64 string; new entries are
+ * { key, roster, from } so the client can check group senders against the
+ * roster and know who distributed the key.
+ */
+function normalizeGroupRecord(value) {
+  if (!value) return null;
+  if (typeof value === "string") return { key: value, roster: null, from: null };
+  if (typeof value === "object" && typeof value.key === "string") return value;
+  return null;
+}
+
+export function getGroupRecord(groupId) {
+  return normalizeGroupRecord(loadGroupKeys()[groupId]);
+}
+
+function saveGroupKey(groupId, rawKeyB64, meta = {}) {
   const all = loadGroupKeys();
-  all[groupId] = rawKeyB64;
+  all[groupId] = {
+    key: rawKeyB64,
+    roster: Array.isArray(meta.roster) ? meta.roster : null,
+    from: meta.from || null,
+  };
   localStorage.setItem(GROUP_KEYS_STORE, JSON.stringify(all));
 }
 
 export function getGroupRawKey(groupId) {
-  const b64 = loadGroupKeys()[groupId];
-  return b64 ? b64decode(b64) : null;
+  const rec = getGroupRecord(groupId);
+  return rec ? b64decode(rec.key) : null;
 }
 
 /** Create a group, store its key locally + sealed-to-self in the pod, and
@@ -214,12 +235,11 @@ export async function createGroup(title, members, opts = {}) {
   const groupId = "g-" + bytesToHex(crypto.getRandomValues(new Uint8Array(8)));
   const rawKey = randomGroupKey();
   const rawKeyB64 = b64encode(rawKey);
-  saveGroupKey(groupId, rawKeyB64);
-
   const roster = [
     { handle: identity.handle, x: identity.xPublicKeyHex, podUrl: identity.podUrl },
     ...members.map((m) => ({ handle: m.handle, x: m.x, podUrl: m.podUrl || m.pod_url })),
   ];
+  saveGroupKey(groupId, rawKeyB64, { roster, from: identity.handle });
 
   // Sealed-to-self copy of the key for our other devices.
   const sealedKey = sealEnvelope(
@@ -278,39 +298,99 @@ export async function sendGroup(group, message, opts = {}) {
 // ---- decryption (render-time, on device) ----------------------------------
 
 /**
- * Decrypt a stored message row for display. Returns { direction, from, ts,
- * body, control } or null if it can't be decrypted. Also auto-imports group
- * keys delivered as 1:1 control messages.
+ * Check the envelope's sender against what we already trust.
+ *   - The claimed handle must hash from the claimed signing key.
+ *   - Our own messages must carry our own keys.
+ *   - Anyone else must be a saved contact whose stored keys match the envelope.
+ * Returns null when trusted, or a short reason string when not.
  */
-export function decryptRow(identity, row) {
+function senderProblem(identity, envelope, contacts) {
+  if (!senderHandleBound(envelope)) return "sender_handle_mismatch";
+  if (envelope.from === identity.handle) {
+    if (envelope.fromEd !== identity.edPublicKeyHex) return "self_key_mismatch";
+    if (envelope.kind === "dm" && envelope.fromX !== identity.xPublicKeyHex) return "self_key_mismatch";
+    return null;
+  }
+  const c = contacts?.[envelope.from];
+  if (!c) return "unknown_sender";
+  if (c.ed !== envelope.fromEd) return "contact_key_mismatch";
+  if (envelope.kind === "dm" && c.x !== envelope.fromX) return "contact_key_mismatch";
+  return null;
+}
+
+function rosterHas(roster, handle) {
+  return Array.isArray(roster) && roster.some((m) => m && m.handle === handle);
+}
+
+/**
+ * Decrypt a stored message row for display. Returns { direction, from, ts,
+ * body, control } or a row marked error/untrusted/locked. Also imports group
+ * keys delivered as 1:1 control messages, but only from a verified contact
+ * who is on the roster they sent, and never silently replaces an existing key.
+ *
+ * @param {object} identity
+ * @param {object} row
+ * @param {object} ctx  { contacts: { [handle]: contactRow } }  REQUIRED for
+ *                      inbound messages; without it every non-self sender is
+ *                      treated as unknown.
+ */
+export function decryptRow(identity, row, ctx = {}) {
   let envelope;
   try {
     envelope = JSON.parse(row.envelope_json);
   } catch {
     return null;
   }
+  const base = { direction: row.direction, from: envelope.from, ts: envelope.ts };
+
+  const problem = senderProblem(identity, envelope, ctx.contacts || {});
+  if (problem) {
+    return { ...base, body: null, untrusted: true, reason: problem };
+  }
+
   const self = selfForCrypto(identity);
   let plaintext;
   try {
     if (envelope.kind === "group") {
-      const rawKey = getGroupRawKey(envelope.groupId);
-      if (!rawKey) return { direction: row.direction, from: envelope.from, ts: envelope.ts, body: null, locked: true };
-      plaintext = openGroupEnvelope(rawKey, envelope);
+      const rec = getGroupRecord(envelope.groupId);
+      if (!rec) return { ...base, body: null, locked: true };
+      // Legacy records have no roster; new ones must list the sender.
+      if (rec.roster && !rosterHas(rec.roster, envelope.from)) {
+        return { ...base, body: null, untrusted: true, reason: "not_in_roster" };
+      }
+      plaintext = openGroupEnvelope(b64decode(rec.key), envelope);
     } else {
       // Both inbound messages and our own self-copies are sealed to us.
       plaintext = openDmEnvelope(self, envelope);
     }
   } catch {
-    return { direction: row.direction, from: envelope.from, ts: envelope.ts, body: null, error: true };
+    return { ...base, body: null, error: true };
   }
+
   if (plaintext && plaintext.type === "group-key") {
-    saveGroupKey(plaintext.groupId, plaintext.key);
-    return { direction: row.direction, from: envelope.from, ts: envelope.ts, control: plaintext };
+    const result = importGroupKey(identity, envelope, plaintext);
+    return { ...base, control: plaintext, groupKeyImport: result };
   }
-  return {
-    direction: row.direction,
-    from: envelope.from,
-    ts: envelope.ts,
-    body: plaintext?.body ?? null,
-  };
+  return { ...base, body: plaintext?.body ?? null };
+}
+
+/**
+ * Accept a delivered group key only if:
+ *   - the sender (already verified as self or a pinned contact) is on the
+ *     roster they sent, and we are on it too;
+ *   - we do not already hold a DIFFERENT key for that group.
+ * Returns "imported" | "unchanged" | "rejected:<reason>".
+ */
+function importGroupKey(identity, envelope, plaintext) {
+  const { groupId, key, roster } = plaintext;
+  if (typeof groupId !== "string" || typeof key !== "string") return "rejected:malformed";
+  if (!rosterHas(roster, envelope.from)) return "rejected:sender_not_in_roster";
+  if (!rosterHas(roster, identity.handle)) return "rejected:self_not_in_roster";
+  const existing = getGroupRecord(groupId);
+  if (existing) {
+    if (existing.key === key) return "unchanged";
+    return "rejected:conflicting_key";
+  }
+  saveGroupKey(groupId, key, { roster, from: envelope.from });
+  return "imported";
 }

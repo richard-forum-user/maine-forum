@@ -67,7 +67,7 @@ export default function Messenger() {
     try {
       const rows = await listMessages(active.id);
       const decoded = rows
-        .map((r) => ({ row: r, dec: decryptRow(identity, r) }))
+        .map((r) => ({ row: r, dec: decryptRow(identity, r, { contacts: contactsByHandle }) }))
         .filter((x) => x.dec && !x.dec.control);
       setMessages(decoded);
       // flush outbox so delivery retries promptly
@@ -75,7 +75,7 @@ export default function Messenger() {
     } catch (e) {
       flash(e.message, "bad");
     }
-  }, [active, identity, flash]);
+  }, [active, identity, flash, contactsByHandle]);
 
   useEffect(() => {
     refreshLists();
@@ -300,7 +300,11 @@ function Conversation({ active, messages, identity, contactsByHandle, draft, set
         )}
         {messages.map(({ row, dec }, i) => {
           const mine = dec.direction === "out";
-          const who = mine ? "You" : contactsByHandle[dec.from]?.display_name || dec.from;
+          const who = mine
+            ? "You"
+            : dec.untrusted
+              ? `unverified (${dec.reason})`
+              : contactsByHandle[dec.from]?.display_name || dec.from;
           return (
             <div key={row.msg_id || i} style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "70%" }}>
               <div
@@ -313,10 +317,16 @@ function Conversation({ active, messages, identity, contactsByHandle, draft, set
                   lineHeight: 1.45,
                   whiteSpace: "pre-wrap",
                   wordBreak: "break-word",
-                  color: dec.error ? t.bad : t.text,
+                  color: dec.error || dec.untrusted ? t.bad : t.text,
                 }}
               >
-                {dec.error ? "[could not decrypt]" : dec.locked ? "[no group key yet]" : dec.body}
+                {dec.untrusted
+                  ? "[hidden: sender not verified]"
+                  : dec.error
+                    ? "[could not decrypt]"
+                    : dec.locked
+                      ? "[no group key yet]"
+                      : dec.body}
               </div>
               <div style={{ fontSize: 10, color: t.faint, marginTop: 3, textAlign: mine ? "right" : "left" }}>
                 {who} · {relTime(dec.ts)}

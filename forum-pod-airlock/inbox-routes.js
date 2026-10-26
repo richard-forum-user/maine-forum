@@ -57,6 +57,13 @@ async function verifyEnvelopeSig(envelope) {
   );
 }
 
+async function handleMatchesKey(envelope) {
+  if (typeof envelope.fromEd !== "string" || !/^[0-9a-fA-F]{64}$/.test(envelope.fromEd)) return false;
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", hexToBytes(envelope.fromEd)));
+  const hex = Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
+  return envelope.from === `pk-${hex.slice(0, 16)}`;
+}
+
 async function ensureOwnerTable(env) {
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS pod_owner (
@@ -133,6 +140,9 @@ export async function handleInboxRoute(request, env, url) {
 
   const sigOk = await verifyEnvelopeSig(envelope);
   if (!sigOk) return json({ error: "bad_signature" }, 401);
+  // The claimed handle must be the hash of the signing key, so a sender
+  // cannot label an envelope with someone else's handle.
+  if (!(await handleMatchesKey(envelope))) return json({ error: "sender_handle_mismatch" }, 401);
 
   const owner = await lookupOwner(env, envelope.kind === "dm" ? envelope.to : null);
   if (!owner) return json({ error: "pod_not_provisioned" }, 503);

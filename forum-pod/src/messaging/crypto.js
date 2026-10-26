@@ -68,6 +68,32 @@ export function canonical(obj) {
   return JSON.stringify(sorted);
 }
 
+// ---- identity binding -----------------------------------------------------
+
+/** Handle is a hash of the Ed25519 public key, so a handle names exactly one key. */
+export function deriveHandle(edPublicKeyHex) {
+  const digest = sha256(hexToBytes(edPublicKeyHex));
+  return `pk-${bytesToHex(digest).slice(0, 16)}`;
+}
+
+/** True if `hex` is a 32-byte key in lowercase/uppercase hex. */
+export function isKeyHex(hex) {
+  return typeof hex === "string" && /^[0-9a-fA-F]{64}$/.test(hex);
+}
+
+/**
+ * The envelope's claimed handle must be the hash of its claimed signing key.
+ * This alone does NOT prove who sent it (anyone can mint a key); callers must
+ * also pin `fromEd`/`fromX` to a known contact. See verifySenderAgainstContact.
+ */
+export function senderHandleBound(envelope) {
+  try {
+    return isKeyHex(envelope?.fromEd) && envelope.from === deriveHandle(envelope.fromEd);
+  } catch {
+    return false;
+  }
+}
+
 // ---- keys -----------------------------------------------------------------
 
 /** Derive an X25519 encryption keypair from 32 bytes of seed material. */

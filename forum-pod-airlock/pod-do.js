@@ -822,6 +822,19 @@ export class PersonalPodDO {
       if (ownerHandle && envelope.to && envelope.to !== ownerHandle) {
         return jsonResp(404, { error: "not_for_this_pod" });
       }
+      // Direct messages are accepted only from saved contacts whose stored
+      // keys match the envelope. Unknown senders get 403; the sender's outbox
+      // retries with backoff, so a message sent before the recipient adds the
+      // sender back is delivered once they do (within the retry window).
+      const contact = this.sql
+        .exec(`SELECT ed, x FROM contacts WHERE handle = ?`, envelope.from || "")
+        .toArray()[0];
+      if (!contact) {
+        return jsonResp(403, { error: "unknown_sender" });
+      }
+      if (contact.ed !== envelope.fromEd || contact.x !== envelope.fromX) {
+        return jsonResp(403, { error: "contact_key_mismatch" });
+      }
     }
     const now = new Date().toISOString();
     const kind = envelope.kind === "group" ? "group" : "dm";
