@@ -47,19 +47,21 @@ async function importEd25519PublicKey(publicKeyHex) {
   );
 }
 
+/** Clock skew allowed in either direction. A taskbar that agrees to the minute can still be 31–90s fast. */
+const MAX_SKEW_MS = 5 * 60 * 1000;
+
 /**
  * Verify a signed bundle. If `expectedPublicKeyHex` is provided, the
  * bundle's key must match (used by the DO once it has TOFU-registered
  * a credential's public key on first request).
  *
- * `maxAgeMs` is the replay window. 5 minutes is plenty for a phone
- * round-trip; reject anything older (or more than 30s into the future,
- * which would indicate a forged clock).
+ * `maxAgeMs` is the replay window in both directions. Five minutes covers
+ * a phone clock that is fast or slow; anything further out is rejected.
  */
 export async function verifySignedBundle(
   bundle,
   expectedPublicKeyHex = null,
-  maxAgeMs = 5 * 60 * 1000
+  maxAgeMs = MAX_SKEW_MS
 ) {
   if (!bundle || typeof bundle !== "object") {
     return { valid: false, reason: "missing_bundle" };
@@ -79,7 +81,7 @@ export async function verifySignedBundle(
     return { valid: false, reason: "invalid_timestamp" };
   }
   const age = Date.now() - tsMs;
-  if (age > maxAgeMs || age < -30000) {
+  if (age > maxAgeMs || age < -maxAgeMs) {
     return { valid: false, reason: "timestamp_expired" };
   }
   if (expectedPublicKeyHex && expectedPublicKeyHex !== publicKeyHex) {
