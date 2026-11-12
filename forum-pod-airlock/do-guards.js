@@ -5,9 +5,17 @@
 export const MAX_POD_BODY_BYTES = 256 * 1024;
 export const MAX_POD_WRITES_PER_MINUTE = 60;
 
-export function podBodyTooLarge(bodyText) {
+export function podBodyTooLarge(bodyText, maxBytes = MAX_POD_BODY_BYTES) {
   if (!bodyText) return false;
-  return new TextEncoder().encode(bodyText).length > MAX_POD_BODY_BYTES;
+  return new TextEncoder().encode(bodyText).length > maxBytes;
+}
+
+/** Reject a declared Content-Length before the body is buffered. */
+export function declaredBodyTooLarge(request, maxBytes = MAX_POD_BODY_BYTES) {
+  const raw = request?.headers?.get?.("content-length");
+  if (raw == null || raw === "") return false;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > maxBytes;
 }
 
 export async function ensurePodUsageSchema(db) {

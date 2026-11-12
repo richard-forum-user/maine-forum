@@ -220,6 +220,17 @@ export class FamilyDO {
   async dispatch(verb, path, data) {
     const me = this._me;
 
+    // Pending members may poll their own status and wrapped keys. They may
+    // not read the feed, albums, or roster, and they may not rewrite the
+    // family name via PROVISION. Writes other than /join are also rejected
+    // below for the same reason.
+    const pendingAllowed =
+      (verb === "GET" && (path === "/family" || path === "/keys")) ||
+      (verb === "POST" && path === "/join");
+    if (me.status !== "active" && !pendingAllowed) {
+      return { status: 403, body: { error: "not_admitted" } };
+    }
+
     // ---- family / identity ----
     if (verb === "PROVISION" && path === "/") {
       const epoch = this.currentEpoch();

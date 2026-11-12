@@ -7,14 +7,9 @@ export { PersonalPodDO } from './pod-do.js';
 export { FamilyDO } from './family-do.js';
 
 import { sessionIdMatchesPubkey } from './session-binding.js';
-import {
-  issueUnlockToken,
-  isLocalDeviceCredentialId,
-  isPilotCredentialId,
-  verifyUnlockToken,
-} from './unlock-token.js';
+import { issueUnlockToken } from './unlock-token.js';
 import { checkRateLimit, clientIp } from './rate-limit.js';
-import { checkPodWriteBudget, podBodyTooLarge } from './do-guards.js';
+import { checkPodWriteBudget, declaredBodyTooLarge, podBodyTooLarge } from './do-guards.js';
 import { handleWebAuthnRoute } from './webauthn-server.js';
 import { handleInboxRoute, recordPodOwner } from './inbox-routes.js';
 
@@ -64,38 +59,6 @@ async function assertSessionBinding(bundle) {
   const matches = await sessionIdMatchesPubkey(bundle.sessionId, bundle.publicKeyHex);
   if (!matches) {
     return { ok: false, reason: 'session_id_binding_mismatch' };
-  }
-  return { ok: true };
-}
-
-async function assertUnlocked(env, bundle) {
-  if (!env.UNLOCK_TOKEN_KEY) {
-    return { ok: true, skipped: true };
-  }
-  const deviceCredentialId = bundle.deviceCredentialId || null;
-  if (isPilotCredentialId(deviceCredentialId)) {
-    if (env.ALLOW_PILOT_BUNDLES === '1') {
-      return { ok: true, pilot: true };
-    }
-    return { ok: false, reason: 'pilot_bundles_disabled' };
-  }
-  if (isLocalDeviceCredentialId(deviceCredentialId)) {
-    return { ok: true, local: true };
-  }
-  if (!deviceCredentialId) {
-    return { ok: false, reason: 'missing_device_credential_id' };
-  }
-  const verdict = await verifyUnlockToken(
-    env,
-    bundle.unlockToken,
-    bundle.signature,
-    env.DB
-  );
-  if (!verdict.ok) {
-    return verdict;
-  }
-  if (deviceCredentialId && deviceCredentialId !== verdict.credentialId) {
-    return { ok: false, reason: 'credential_mismatch' };
   }
   return { ok: true };
 }
@@ -152,19 +115,27 @@ async function forwardFamilyRpc(env, bodyText) {
   return new Response(text, { status: upstream.status, headers: { 'Content-Type': 'application/json', ...CORS } });
 }
 
-// Family media upload/serve backed by R2. Upload requires a signed-bundle
-// auth header proving the caller is a family member (checked via the DO);
-// serving is by unguessable key (self-hosted, TLS, not E2E by design).
+// Family media upload/serve backed by R2. The client encrypts bytes with the
+// family content key before upload. Upload is allowed only when the Family DO
+// accepts a signed /media/authorize bundle from an admitted member. Objects
+// are served as opaque ciphertext (unguessable key); the stored content type
+// is ignored so an upload cannot be rendered as HTML on this origin.
+const FAMILY_MEDIA_MAX_BYTES = 12 * 1024 * 1024;
+
 async function handleFamilyMedia(request, env, url) {
   if (!env.MEDIA) return jsonResponse({ error: 'media_not_configured' }, 500);
   const key = url.pathname.slice(FAMILY_MEDIA_PREFIX.length + 1);
 
   if (request.method === 'GET') {
-    if (!key) return jsonResponse({ error: 'missing_key' }, 400);
+    if (!key || key.includes('/') || key.includes('\\') || key.includes('..')) {
+      return jsonResponse({ error: 'bad_key' }, 400);
+    }
     const obj = await env.MEDIA.get(`family/${key}`);
     if (!obj) return jsonResponse({ error: 'not_found' }, 404);
     const headers = new Headers({ ...CORS });
-    obj.writeHttpMetadata(headers);
+    headers.set('Content-Type', 'application/octet-stream');
+    headers.set('X-Content-Type-Options', 'nosniff');
+    headers.set('Content-Disposition', 'attachment');
     headers.set('Cache-Control', 'private, max-age=31536000');
     return new Response(obj.body, { status: 200, headers });
   }
@@ -173,14 +144,15 @@ async function handleFamilyMedia(request, env, url) {
     // Auth bundle travels in a header so the body can be the raw bytes.
     const authHeader = request.headers.get('X-Podlink-Auth');
     if (!authHeader) return jsonResponse({ error: 'missing_auth' }, 401);
+    if (authHeader.length > 16384) return jsonResponse({ error: 'bad_auth' }, 400);
     let bundle;
     try {
       bundle = JSON.parse(atob(authHeader));
     } catch {
       return jsonResponse({ error: 'bad_auth' }, 400);
     }
-    // The DO verifies the Ed25519 signature, replay, and membership; a signed
-    // `/media/authorize` bundle returns 200 only for enrolled members.
+    // Any admitted-member call used to count: GET /family returns 200 for a
+    // pending member. Only the authorize route returns { ok, member }.
     const check = await familyStub(env).fetch(
       new Request('https://family-do/', {
         method: 'POST',
@@ -188,15 +160,26 @@ async function handleFamilyMedia(request, env, url) {
         body: JSON.stringify(bundle),
       })
     );
+    const checkText = await check.text();
     if (check.status !== 200) {
-      const t = await check.text();
-      return new Response(t, { status: check.status, headers: { 'Content-Type': 'application/json', ...CORS } });
+      return new Response(checkText, { status: check.status, headers: { 'Content-Type': 'application/json', ...CORS } });
+    }
+    let authorized = false;
+    try {
+      const body = JSON.parse(checkText);
+      authorized = body?.ok === true && typeof body.member === 'string' && body.member.length > 0;
+    } catch {
+      authorized = false;
+    }
+    if (!authorized) return jsonResponse({ error: 'not_authorized' }, 401);
+    if (declaredBodyTooLarge(request, FAMILY_MEDIA_MAX_BYTES)) {
+      return jsonResponse({ error: 'too_large' }, 413);
     }
     const bytes = await request.arrayBuffer();
-    if (bytes.byteLength > 12 * 1024 * 1024) return jsonResponse({ error: 'too_large' }, 413);
+    if (bytes.byteLength > FAMILY_MEDIA_MAX_BYTES) return jsonResponse({ error: 'too_large' }, 413);
     const r2key = `${Date.now().toString(36)}-${crypto.randomUUID()}`;
     await env.MEDIA.put(`family/${r2key}`, bytes, {
-      httpMetadata: { contentType: request.headers.get('Content-Type') || 'application/octet-stream' },
+      httpMetadata: { contentType: 'application/octet-stream' },
     });
     return jsonResponse({ ok: true, r2_key: r2key }, 200);
   }
@@ -258,6 +241,9 @@ export default {
       if (!env.FAMILY) {
         return jsonResponse({ error: 'family_do_not_bound' }, 500);
       }
+      if (declaredBodyTooLarge(request)) {
+        return jsonResponse({ error: 'payload_too_large' }, 413);
+      }
       let bodyText;
       try {
         bodyText = await request.text();
@@ -289,6 +275,9 @@ export default {
       if (!env.POD) {
         return jsonResponse({ error: 'pod_do_not_bound' }, 500);
       }
+      if (declaredBodyTooLarge(request)) {
+        return jsonResponse({ error: 'payload_too_large' }, 413);
+      }
       let bodyText;
       try {
         bodyText = await request.text();
@@ -308,9 +297,9 @@ export default {
       if (!binding.ok) {
         return jsonResponse({ error: 'auth_failed', reason: binding.reason }, 401);
       }
-      // podlink has no passkey/unlock-token layer: device auth is the Ed25519
-      // signed bundle (verified above + in the DO) plus the DO device
-      // allowlist. The legacy WebAuthn unlock gate is intentionally not used.
+      // Device auth is the Ed25519 signed bundle (checked in the DO) plus the
+      // DO device allowlist. Do not record inbox routing until that check
+      // accepts the bundle: sessionId binding alone is not a signature.
       const sessionId = bundle.sessionId;
       if (env.DB) {
         const budget = await checkPodWriteBudget(env.DB, sessionId);
@@ -318,17 +307,30 @@ export default {
           return jsonResponse({ error: budget.reason || 'pod_rate_limited' }, 429);
         }
       }
-      // Record handle -> pod-id routing so the public inbox can deliver mail
-      // to this owner's Durable Object across all their devices.
+      const upstream = await forwardPodRpc(request, env, bodyText, bundle);
       const pl = bundle.payload;
-      if (pl && pl.verb === 'PROVISION' && pl.data && pl.data.handle && pl.data.pod_id && env.DB) {
+      if (
+        upstream.status === 200 &&
+        pl &&
+        pl.verb === 'PROVISION' &&
+        pl.data &&
+        pl.data.handle &&
+        pl.data.pod_id &&
+        env.DB
+      ) {
         try {
-          await recordPodOwner(env, pl.data.handle, pl.data.pod_id);
+          const recorded = await recordPodOwner(env, pl.data.handle, pl.data.pod_id);
+          if (recorded && !recorded.ok && recorded.reason !== 'invalid_owner_record') {
+            return jsonResponse(
+              { error: 'pod_identity_conflict', reason: recorded.reason },
+              409
+            );
+          }
         } catch {
           /* non-fatal: inbox routing can be re-registered later */
         }
       }
-      return forwardPodRpc(request, env, bodyText, bundle);
+      return upstream;
     }
 
     // Any non-API GET maps to the static asset bundle. Unmatched paths

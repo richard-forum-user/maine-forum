@@ -24,17 +24,12 @@ const podWorker :Workerd.Worker = (
     (name = "do-guards", esModule = embed "{AIRLOCK_DIR}/do-guards.js"),
     (name = "webauthn-server", esModule = embed "{AIRLOCK_DIR}/webauthn-server.js"),
     (name = "feedback-limits", esModule = embed "{AIRLOCK_DIR}/feedback-limits.js"),
-    (name = "secret-compare", esModule = embed "{AIRLOCK_DIR}/secret-compare.js"),
-    (name = "member-hash", esModule = embed "{AIRLOCK_DIR}/member-hash.js"),
-    (name = "membership-verify", esModule = embed "{AIRLOCK_DIR}/membership-verify.js"),
-    (name = "membership-routes", esModule = embed "{AIRLOCK_DIR}/membership-routes.js"),
-    (name = "pod-sync", esModule = embed "{AIRLOCK_DIR}/pod-sync.js"),
-  ],
-  bindings = [
-    (name = "COOP_URL", text = "https://coop.yourcommunity.forum"),
+    (name = "family-do", esModule = embed "{AIRLOCK_DIR}/family-do.js"),
+    (name = "inbox-routes", esModule = embed "{AIRLOCK_DIR}/inbox-routes.js"),
   ],
   durableObjectNamespaces = [
     (name = "POD", className = "PersonalPodDO", uniqueKey = "forum-stack-desktop"),
+    (name = "FAMILY", className = "FamilyDO", uniqueKey = "podlink-desktop-family"),
   ],
   durableObjectStorage = (localDisk = "podDiskStore"),
 );

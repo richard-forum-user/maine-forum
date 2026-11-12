@@ -1,29 +1,20 @@
-# Forum Pod
+# forum-pod
 
-Local-first personal civic data pod, served as a React/Vite PWA and signed
-against the cooperative Cloudflare Worker.
+React PWA for podlink. `src/app.jsx` mounts the family app
+(`src/family/FamilyApp.jsx`): an invite-only feed, photo albums, and calendar.
+Posts, names, and photos are encrypted on the device. The worker stores
+ciphertext.
 
-## Civic AI Kami
+There is no AI and no cooperative in this package. Nothing here calls a model.
 
-This repo vendors Audrey Tang and Caroline Green's Civic AI / 6-Pack of Care
-materials from [`audreyt/civic.ai`](https://github.com/audreyt/civic.ai).
-The upstream project is published under `CC0-1.0`, and the vendored commit is
-recorded in `src/civic-ai/VERSION.json`.
+`src/messaging/` is the device-to-device sealing library (crypto, identity, pod
+RPC). `Messenger.jsx` is not the screen `app.jsx` renders.
 
-Relevant local paths:
-
-- `scripts/vendor-civic-ai.mjs` refreshes the CC0 content and system prompt.
-- `public/civic-ai/*.md` powers the offline 6-Pack reader.
-- `src/civic-ai/skill.md` stores the OpenClaw bootstrap guide from `kami.civic.ai`.
-- `src/civic-ai/system-prompt.txt` is the local Civic AI Kami system prompt.
-
-Run:
+## Development
 
 ```bash
-npm run vendor:civic-ai
+npm install
+npm run dev
 npm run build
+node scripts/crypto-selftest.mjs
 ```
-
-The Assistant tab is gated in Settings. Conversations stay in this device's
-IndexedDB and are cleared on sign-out; the Worker logs quota and token counts
-only.

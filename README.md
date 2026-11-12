@@ -12,9 +12,10 @@ aggregation, and no AI.
   see ciphertext.
 - **Pseudonymous by design.** Your identity is a random handle plus keys and a
   Pod URL — no name, email, or phone required. PII never leaves your device.
-- **Direct, pod-to-pod.** Messages go straight from your Pod to your contact's
-  Pod, with sender-side store-and-forward retry for pods that are briefly
-  offline. 1:1 and group channels.
+- **Family space on your Pod.** The app that opens is an invite-only feed,
+  photo albums, and calendar. Those are encrypted on the device.
+- **Pod-to-pod mail is in the library.** `forum-pod/src/messaging/` seals 1:1
+  and group envelopes, and the Pod retries delivery. That UI is not mounted.
 - **Yours to recover.** A 12-word recovery phrase deterministically re-derives
   your identity and re-pairs new devices against your own Pod.
 
@@ -27,8 +28,8 @@ non-negotiable invariants.
 
 | Path | What it is |
 | --- | --- |
-| `forum-pod/` | The PWA (React) — first-run wizard + messenger. Entry: `src/app.jsx`. |
-| `forum-pod/src/messaging/` | E2E crypto (`crypto.js`), identity (`identity.js`), client (`client.js`), UI (`Messenger.jsx`). |
+| `forum-pod/` | The PWA (React). Entry `src/app.jsx` mounts the family app. |
+| `forum-pod/src/messaging/` | E2E crypto, identity, and pod RPC. Not the mounted screen. |
 | `forum-pod-airlock/` | The Pod worker: `secure-worker.js` + `PersonalPodDO` (`pod-do.js`) + public `inbox-routes.js`. |
 | `cli/` | `podlink setup` — the guided installer (cloud or home hub). |
 | `desktop/` | Tauri desktop app (boots `workerd` locally, controls the home tunnel). |
@@ -41,8 +42,8 @@ non-negotiable invariants.
 # 1. Stand up your Pod (interactive: choose cloud or home)
 cd cli && node podlink.mjs setup
 
-# 2. Open the app, create your identity, point it at your Pod URL,
-#    share your invite, and start messaging.
+# 2. Open the Pod URL. Create a family, or join with an invite link.
+#    An admin admits new people. The app does not open a chat wizard.
 ```
 
 See [`INSTALL.md`](INSTALL.md) for full setup and [`docs/PIPELINE.md`](docs/PIPELINE.md)

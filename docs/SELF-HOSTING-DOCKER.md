@@ -24,8 +24,6 @@ SQLite and DO state persist under `./pod-data` (mounted at `/data` in the contai
 tar -czf pod-backup.tgz pod-data/
 ```
 
-## Cooperative sync
+## No cooperative sync
 
-Set `COOP_URL` in `docker-compose.yml` to your cooperative pipeline URL. Complete membership verification in the app before syncing.
-
-The cooperative codebase contains **no** routes that dial your pod — sync is always pod-initiated.
+This deployment does not sync to a cooperative or a shared relay. There is no membership check and no `COOP_URL`.

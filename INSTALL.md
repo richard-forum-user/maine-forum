@@ -1,8 +1,8 @@
 # Installing podlink
 
-You need two things: a **Pod** (your hub) and the **app** (where you read and
-write messages). The `podlink setup` CLI stands up the Pod; the app's first-run
-wizard connects you to it.
+You need two things: a **Pod** (your hub) and the **app** (the family space
+served by that Pod). The `podlink setup` CLI stands up the Pod. Open the Pod
+URL and create a family or join with an invite.
 
 ## Prerequisites
 
@@ -51,27 +51,26 @@ cd cli && node podlink.mjs setup --home
 node podlink.mjs config --url https://<your>.trycloudflare.com
 ```
 
-On the **desktop app** you don't need a terminal: open **Settings → Home tunnel**,
-press **Start tunnel**, then **Use as my Pod URL**. For a stable hostname, create
-a named tunnel + DNS route (see `docs/PIPELINE.md`).
+The desktop process can start a tunnel, but the mounted family app has no
+**Settings → Home tunnel** screen. Use the CLI above. For a stable hostname,
+create a named tunnel + DNS route (see `docs/PIPELINE.md`).
 
 ## Connect the app
 
-1. Start the app (or open your Pod URL in a browser; the PWA is served by the Pod).
-   - Dev: `cd forum-pod && npm run dev`
-2. **Create your identity** — save the 12-word recovery phrase.
-3. **Connect your Pod** — paste the URL the CLI printed (auto-detected on desktop),
-   then *Connect & provision*.
-4. **Share your invite** (QR or code). Add a contact's invite under **Contacts**;
-   both sides must add each other.
-5. Start messaging. Create **group channels** from Contacts.
+1. Open the Pod URL in a browser (the worker serves the PWA), or run
+   `cd forum-pod && npm run dev`.
+2. **Create a family** (family name and your name) or open an invite link and
+   **join**.
+3. An admin admits joiners. Until then the app shows a waiting screen and the
+   Pod does not return the feed, albums, or roster.
+4. Share a new invite from the Family tab when you want another person.
 
-## Add another device / restore after loss
+## Add another device
 
-On the new device choose **"Restoring on a new device? Enter your recovery
-phrase"** in the wizard. podlink re-derives your identity and, when you connect
-your Pod, proves your recovery key to re-pair this device automatically. You can
-also authorize a device's signing key directly under **Settings → Paired devices**.
+A new device needs its own invite and a fresh admission. The mounted app has
+no 12-word restore screen and no **Settings → Paired devices** page. The
+messaging library can re-pair a device with a recovery phrase, but that screen
+is not what the app opens.
 
 ## Tear down test deploys
 

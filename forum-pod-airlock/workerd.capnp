@@ -23,17 +23,22 @@ const podWorker :Workerd.Worker = (
     (name = "do-guards", esModule = embed "do-guards.js"),
     (name = "webauthn-server", esModule = embed "webauthn-server.js"),
     (name = "feedback-limits", esModule = embed "feedback-limits.js"),
-    (name = "secret-compare", esModule = embed "secret-compare.js"),
     (name = "inbox-routes", esModule = embed "inbox-routes.js"),
+    (name = "family-do", esModule = embed "family-do.js"),
   ],
   bindings = [
     (name = "POD", durableObjectNamespace = (
       className = "PersonalPodDO",
       uniqueKey = "podlink-local",
     )),
+    (name = "FAMILY", durableObjectNamespace = (
+      className = "FamilyDO",
+      uniqueKey = "podlink-local-family",
+    )),
     (name = "PUBLIC_POD_URL", text = ""),
   ],
   durableObjectNamespaces = [
     (name = "POD", className = "PersonalPodDO", uniqueKey = "podlink-local"),
+    (name = "FAMILY", className = "FamilyDO", uniqueKey = "podlink-local-family"),
   ],
 );
