@@ -149,6 +149,15 @@ export function sealEnvelope(self, target, message) {
   return { ...core, sig: bytesToHex(sig) };
 }
 
+/**
+ * True when a saved contact card's Ed25519 key is the key that signed the
+ * envelope. A matching handle with a different key is not that contact.
+ */
+export function senderMatchesContact(fromEd, contactEd) {
+  if (!fromEd || !contactEd) return false;
+  return String(fromEd).toLowerCase() === String(contactEd).toLowerCase();
+}
+
 /** Verify the envelope signature against its claimed sender Ed25519 key. */
 export function verifyEnvelopeSig(envelope) {
   const { sig, ...core } = envelope;

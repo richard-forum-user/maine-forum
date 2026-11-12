@@ -294,22 +294,23 @@ export function decryptRow(identity, row) {
   try {
     if (envelope.kind === "group") {
       const rawKey = getGroupRawKey(envelope.groupId);
-      if (!rawKey) return { direction: row.direction, from: envelope.from, ts: envelope.ts, body: null, locked: true };
+      if (!rawKey) return { direction: row.direction, from: envelope.from, fromEd: envelope.fromEd, ts: envelope.ts, body: null, locked: true };
       plaintext = openGroupEnvelope(rawKey, envelope);
     } else {
       // Both inbound messages and our own self-copies are sealed to us.
       plaintext = openDmEnvelope(self, envelope);
     }
   } catch {
-    return { direction: row.direction, from: envelope.from, ts: envelope.ts, body: null, error: true };
+    return { direction: row.direction, from: envelope.from, fromEd: envelope.fromEd, ts: envelope.ts, body: null, error: true };
   }
   if (plaintext && plaintext.type === "group-key") {
     saveGroupKey(plaintext.groupId, plaintext.key);
-    return { direction: row.direction, from: envelope.from, ts: envelope.ts, control: plaintext };
+    return { direction: row.direction, from: envelope.from, fromEd: envelope.fromEd, ts: envelope.ts, control: plaintext };
   }
   return {
     direction: row.direction,
     from: envelope.from,
+    fromEd: envelope.fromEd,
     ts: envelope.ts,
     body: plaintext?.body ?? null,
   };

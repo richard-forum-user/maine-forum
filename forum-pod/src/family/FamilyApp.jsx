@@ -67,7 +67,7 @@ export default function FamilyApp() {
         {loadErr && <div style={{ ...s.card, color: t.bad, marginBottom: 12 }}>{loadErr}</div>}
         {me && me.status === "active" && !hasKey() && (
           <div style={{ ...s.card, color: t.warn, marginBottom: 12 }}>
-            Syncing your encryption key\u2026 if this persists, ask an admin to re-admit this device.
+            {"Syncing your encryption key… if this persists, ask an admin to re-admit this device."}
           </div>
         )}
         {tab === "feed" && <Feed me={me} names={names} />}
@@ -97,8 +97,7 @@ function WaitingScreen({ onRefresh }) {
           <div style={{ fontSize: 40 }}>{"\u23F3"}</div>
           <div style={{ fontWeight: 700, fontSize: 18 }}>Almost in!</div>
           <div style={{ color: t.dim, fontSize: 14 }}>
-            A family admin needs to approve you. They'll see your request and let you in \u2014 then this
-            unlocks automatically. Nothing is visible to you until you're admitted.
+            {"A family admin needs to approve you. They'll see your request and let you in — then this unlocks automatically. Nothing is visible to you until you're admitted."}
           </div>
           <button
             style={s.btn("primary")}

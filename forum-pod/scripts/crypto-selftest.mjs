@@ -12,6 +12,7 @@ import {
   openGroupEnvelope,
   randomGroupKey,
   bytesToHex,
+  senderMatchesContact,
 } from "../src/messaging/crypto.js";
 import { mnemonicToSeedSync } from "@scure/bip39";
 
@@ -73,5 +74,11 @@ const genv = sealEnvelope(alice, { kind: "group", groupId: "g-test", rawGroupKey
 assert.ok(verifyEnvelopeSig(genv));
 assert.strictEqual(openGroupEnvelope(gkey, genv).body, "group hi", "group member decrypts");
 console.log("[ok] group seal/open round trip");
+
+assert.strictEqual(senderMatchesContact(alice.edPublicKeyHex, alice.edPublicKeyHex), true);
+assert.strictEqual(senderMatchesContact(alice.edPublicKeyHex, bob.edPublicKeyHex), false);
+assert.strictEqual(senderMatchesContact("AA", "aa"), true);
+assert.strictEqual(senderMatchesContact(alice.edPublicKeyHex, null), false);
+console.log("[ok] sender key must match the saved contact");
 
 console.log("\nALL CRYPTO SELF-TESTS PASSED");

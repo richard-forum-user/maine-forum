@@ -25,6 +25,7 @@ import {
   decryptRow,
   podRpc,
 } from "./client.js";
+import { senderMatchesContact } from "./crypto.js";
 
 const POLL_MS = 5000;
 
@@ -300,7 +301,14 @@ function Conversation({ active, messages, identity, contactsByHandle, draft, set
         )}
         {messages.map(({ row, dec }, i) => {
           const mine = dec.direction === "out";
-          const who = mine ? "You" : contactsByHandle[dec.from]?.display_name || dec.from;
+          const contact = contactsByHandle[dec.from];
+          const who = mine
+            ? "You"
+            : contact && senderMatchesContact(dec.fromEd, contact.ed)
+              ? contact.display_name || dec.from
+              : contact
+                ? `unverified ${String(dec.fromEd || "").slice(0, 8)}`
+                : dec.from || "unknown";
           return (
             <div key={row.msg_id || i} style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "70%" }}>
               <div

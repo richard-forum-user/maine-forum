@@ -386,14 +386,20 @@ export class PersonalPodDO {
     const now = new Date().toISOString();
 
     if (verb === "PROVISION") {
+      // The recovery key is the phrase-derived identity. A paired device must
+      // not replace it: that would lock the owner out of re-pair. The same
+      // key may be sent again (the client provisions on every connect).
+      if (data.recovery_pub && /^[0-9a-f]{64}$/i.test(String(data.recovery_pub))) {
+        const next = String(data.recovery_pub).toLowerCase();
+        const existing = this.getMeta("recovery_pub");
+        if (existing && existing.toLowerCase() !== next) {
+          return { status: 409, body: { error: "recovery_pub_already_set" } };
+        }
+        if (!existing) this.setMeta("recovery_pub", next);
+      }
       if (data.webId) this.setMeta(META_KEY_WEBID, data.webId);
       if (data.handle) this.setMeta("owner_handle", data.handle);
       if (data.pod_id) this.setMeta("pod_id", data.pod_id);
-      // Enroll the recovery public key (the phrase-derived identity Ed25519
-      // key) so a fresh device can re-pair after device loss.
-      if (data.recovery_pub && /^[0-9a-f]{64}$/.test(data.recovery_pub)) {
-        this.setMeta("recovery_pub", data.recovery_pub);
-      }
       return {
         status: 200,
         body: {
