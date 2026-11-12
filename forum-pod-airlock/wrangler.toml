@@ -26,23 +26,10 @@ database_id = "REPLACE_WITH_PODLINK_DB_ID"
 name = "POD"
 class_name = "PersonalPodDO"
 
-[[durable_objects.bindings]]
-name = "FAMILY"
-class_name = "FamilyDO"
-
-# R2 bucket for shared family photo albums. Create with:
-#   npx wrangler r2 bucket create podlink-media
-[[r2_buckets]]
-binding = "MEDIA"
-bucket_name = "podlink-media"
-
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["PersonalPodDO"]
 
-[[migrations]]
-tag = "v2"
-new_sqlite_classes = ["FamilyDO"]
 
 [assets]
 directory = "./dist"
