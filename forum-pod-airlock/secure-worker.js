@@ -4,8 +4,6 @@
  */
 
 export { PersonalPodDO } from './pod-do.js';
-export { FamilyDO } from './family-do.js';
-
 import { sessionIdMatchesPubkey } from './session-binding.js';
 import {
   issueUnlockToken,
@@ -20,9 +18,6 @@ import { handleInboxRoute, recordPodOwner } from './inbox-routes.js';
 
 const POD_API_PREFIX = '/api/pod';
 const INBOX_PREFIX = '/api/inbox';
-const FAMILY_API_PREFIX = '/api/family';
-const FAMILY_MEDIA_PREFIX = '/api/family/media';
-
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -132,78 +127,6 @@ async function forwardPodRpc(request, env, bodyText, bundle) {
   return new Response(text, { status: upstream.status, headers });
 }
 
-function familyStub(env) {
-  // Single shared space per deployment. The instance name is versioned so a
-  // fresh deployment can start from a clean roster if ever needed.
-  const id = env.FAMILY.idFromName('family-space-v2');
-  return env.FAMILY.get(id);
-}
-
-async function forwardFamilyRpc(env, bodyText) {
-  const stub = familyStub(env);
-  const upstream = await stub.fetch(
-    new Request('https://family-do/', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: bodyText,
-    })
-  );
-  const text = await upstream.text();
-  return new Response(text, { status: upstream.status, headers: { 'Content-Type': 'application/json', ...CORS } });
-}
-
-// Family media upload/serve backed by R2. Upload requires a signed-bundle
-// auth header proving the caller is a family member (checked via the DO);
-// serving is by unguessable key (self-hosted, TLS, not E2E by design).
-async function handleFamilyMedia(request, env, url) {
-  if (!env.MEDIA) return jsonResponse({ error: 'media_not_configured' }, 500);
-  const key = url.pathname.slice(FAMILY_MEDIA_PREFIX.length + 1);
-
-  if (request.method === 'GET') {
-    if (!key) return jsonResponse({ error: 'missing_key' }, 400);
-    const obj = await env.MEDIA.get(`family/${key}`);
-    if (!obj) return jsonResponse({ error: 'not_found' }, 404);
-    const headers = new Headers({ ...CORS });
-    obj.writeHttpMetadata(headers);
-    headers.set('Cache-Control', 'private, max-age=31536000');
-    return new Response(obj.body, { status: 200, headers });
-  }
-
-  if (request.method === 'POST') {
-    // Auth bundle travels in a header so the body can be the raw bytes.
-    const authHeader = request.headers.get('X-Podlink-Auth');
-    if (!authHeader) return jsonResponse({ error: 'missing_auth' }, 401);
-    let bundle;
-    try {
-      bundle = JSON.parse(atob(authHeader));
-    } catch {
-      return jsonResponse({ error: 'bad_auth' }, 400);
-    }
-    // The DO verifies the Ed25519 signature, replay, and membership; a signed
-    // `/media/authorize` bundle returns 200 only for enrolled members.
-    const check = await familyStub(env).fetch(
-      new Request('https://family-do/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(bundle),
-      })
-    );
-    if (check.status !== 200) {
-      const t = await check.text();
-      return new Response(t, { status: check.status, headers: { 'Content-Type': 'application/json', ...CORS } });
-    }
-    const bytes = await request.arrayBuffer();
-    if (bytes.byteLength > 12 * 1024 * 1024) return jsonResponse({ error: 'too_large' }, 413);
-    const r2key = `${Date.now().toString(36)}-${crypto.randomUUID()}`;
-    await env.MEDIA.put(`family/${r2key}`, bytes, {
-      httpMetadata: { contentType: request.headers.get('Content-Type') || 'application/octet-stream' },
-    });
-    return jsonResponse({ ok: true, r2_key: r2key }, 200);
-  }
-
-  return jsonResponse({ error: 'use_get_or_post' }, 405);
-}
-
 const SECURITY_TXT = `Contact: mailto:security@yourcommunity.forum
 Expires: 2027-05-26T00:00:00.000Z
 Preferred-Languages: en
@@ -241,43 +164,6 @@ export default {
       if (rl) return rl;
       const inboxRes = await handleInboxRoute(request, env, url);
       return inboxRes;
-    }
-
-    if (url.pathname === FAMILY_MEDIA_PREFIX || url.pathname.startsWith(FAMILY_MEDIA_PREFIX + '/')) {
-      const rl = await applyIngressRateLimit(request, env, 'family_media', 120, 60_000);
-      if (rl) return rl;
-      return handleFamilyMedia(request, env, url);
-    }
-
-    if (url.pathname.startsWith(FAMILY_API_PREFIX + '/') || url.pathname === FAMILY_API_PREFIX) {
-      if (request.method !== 'POST') {
-        return jsonResponse({ error: 'use_post' }, 405);
-      }
-      const rl = await applyIngressRateLimit(request, env, 'family_rpc', 240, 60_000);
-      if (rl) return rl;
-      if (!env.FAMILY) {
-        return jsonResponse({ error: 'family_do_not_bound' }, 500);
-      }
-      let bodyText;
-      try {
-        bodyText = await request.text();
-      } catch {
-        return jsonResponse({ error: 'unreadable_body' }, 400);
-      }
-      if (podBodyTooLarge(bodyText)) {
-        return jsonResponse({ error: 'payload_too_large' }, 413);
-      }
-      let bundle;
-      try {
-        bundle = JSON.parse(bodyText);
-      } catch {
-        return jsonResponse({ error: 'invalid_json' }, 400);
-      }
-      const binding = await assertSessionBinding(bundle);
-      if (!binding.ok) {
-        return jsonResponse({ error: 'auth_failed', reason: binding.reason }, 401);
-      }
-      return forwardFamilyRpc(env, bodyText);
     }
 
     if (url.pathname.startsWith(POD_API_PREFIX + '/') || url.pathname === POD_API_PREFIX) {

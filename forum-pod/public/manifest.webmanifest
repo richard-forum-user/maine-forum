@@ -1,7 +1,7 @@
 {
-  "name": "Family",
-  "short_name": "Family",
-  "description": "A private, self-hosted space for your family: shared feed, photos and calendar.",
+  "name": "podlink",
+  "short_name": "podlink",
+  "description": "A personal, device-to-device encrypted pipeline.",
   "start_url": ".",
   "scope": ".",
   "display": "standalone",

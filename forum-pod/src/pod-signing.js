@@ -147,21 +147,6 @@ export async function regenerateSigningKey() {
   return generateAndPersistSigningKey();
 }
 
-/**
- * Sign an arbitrary message string with this device's Ed25519 key. Used for
- * family invite tokens, where an admin vouches for a joiner out of band.
- * Returns hex signature + this device's public key (the admin's member id).
- */
-export async function signMessageWithDeviceKey(messageStr) {
-  const meta = await ensurePodSigningKey();
-  const sig = await crypto.subtle.sign(
-    { name: "Ed25519" },
-    volatileSigningPrivateKey,
-    new TextEncoder().encode(messageStr)
-  );
-  return { signatureHex: bytesToHex(sig), publicKeyHex: meta.publicKeyHex };
-}
-
 export async function signBundle(payload, _sessionHint) {
   const meta = await ensurePodSigningKey();
   const sessionId = meta.sessionId;
