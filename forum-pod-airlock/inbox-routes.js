@@ -78,22 +78,19 @@ export async function recordPodOwner(env, handle, podId) {
     .run();
 }
 
+function pinnedPodId(env) {
+  return typeof env?.OWNER_POD_ID === "string" ? env.OWNER_POD_ID.trim() : "";
+}
+
 async function lookupOwner(env, handle) {
-  if (!env?.DB) return null;
+  if (!env?.DB || !handle) return null;
   await ensureOwnerTable(env);
-  if (handle) {
-    const row = await env.DB.prepare(
-      `SELECT handle, pod_id FROM pod_owner WHERE handle = ?`
-    )
-      .bind(handle)
-      .first();
-    if (row) return row;
-  }
-  // Group messages have no recipient handle; fall back to the (single) owner.
-  const any = await env.DB.prepare(
-    `SELECT handle, pod_id FROM pod_owner ORDER BY updated_at DESC LIMIT 1`
-  ).first();
-  return any || null;
+  const row = await env.DB.prepare(
+    `SELECT handle, pod_id FROM pod_owner WHERE handle = ?`
+  )
+    .bind(handle)
+    .first();
+  return row || null;
 }
 
 function json(body, status = 200) {
@@ -134,13 +131,19 @@ export async function handleInboxRoute(request, env, url) {
   const sigOk = await verifyEnvelopeSig(envelope);
   if (!sigOk) return json({ error: "bad_signature" }, 401);
 
-  const owner = await lookupOwner(env, envelope.kind === "dm" ? envelope.to : null);
-  if (!owner) return json({ error: "pod_not_provisioned" }, 503);
-  if (envelope.kind === "dm" && envelope.to !== owner.handle) {
-    return json({ error: "not_for_this_pod" }, 404);
+  // Mail always lands in the single pinned pod. There is no "most recent
+  // owner" fallback, and a D1 row that points anywhere else is ignored.
+  const pinned = pinnedPodId(env);
+  if (!pinned) return json({ error: "pod_not_pinned" }, 503);
+  if (envelope.kind === "dm") {
+    const owner = await lookupOwner(env, envelope.to);
+    if (!owner || owner.pod_id !== pinned) return json({ error: "pod_not_provisioned" }, 503);
+    if (envelope.to !== owner.handle) return json({ error: "not_for_this_pod" }, 404);
+  } else if (envelope.kind !== "group") {
+    return json({ error: "invalid_envelope" }, 400);
   }
 
-  const id = env.POD.idFromName(owner.pod_id);
+  const id = env.POD.idFromName(pinned);
   const stub = env.POD.get(id);
   const res = await stub.fetch(
     new Request("https://pod-do/inbox", {

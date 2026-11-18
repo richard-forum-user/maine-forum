@@ -4,6 +4,11 @@ compatibility_date = "2026-05-26"
 compatibility_flags = [ "nodejs_compat" ]
 
 [vars]
+# Pinned Durable Object name for this single-owner pod. `podlink setup` and
+# the deploy scripts replace the empty value with a random 128-bit id. Until
+# it is set, device RPC fails closed so a client-supplied pod id cannot mint
+# Durable Objects on this account.
+OWNER_POD_ID = ""
 ALLOW_PILOT_BUNDLES = "0"
 # Allowed WebAuthn origins. Add your own pod URL(s) here. The workers.dev
 # origin is filled in after the first deploy; localhost covers desktop/dev.

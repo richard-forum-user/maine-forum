@@ -5,8 +5,8 @@
 
 import { signBundle as webSignBundle } from "./pod-signing.js";
 
-export async function signBundle(payload, sessionHint) {
-  return webSignBundle(payload, sessionHint);
+export async function signBundle(payload, sessionHint, aud) {
+  return webSignBundle(payload, sessionHint, aud);
 }
 
 export function nativeSigningAvailable() {

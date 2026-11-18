@@ -20,6 +20,7 @@ import { stdin, stdout } from "node:process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 
 const CLI_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO = join(CLI_DIR, "..");
@@ -44,6 +45,7 @@ function log(...a) {
 function run(cmd, args, opts = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd: opts.cwd || REPO, env: process.env, shell: false });
+    if (opts.input != null) child.stdin.end(String(opts.input));
     let out = "";
     child.stdout.on("data", (d) => {
       out += d;
@@ -168,6 +170,8 @@ async function setupCloud(flags) {
 
   const dbId = await ensureD1(dbName);
   patchWranglerToml({ name, dbId });
+  ensureOwnerPodId();
+  const setupToken = writeSetupToken();
 
   log(c.dim("building the pod UI…"));
   await run("npm", ["run", "build:pod"], { cwd: WORKER_DIR });
@@ -180,6 +184,7 @@ async function setupCloud(flags) {
   patchPublicUrl(url);
   log(c.dim("re-deploying with PUBLIC_POD_URL set…"));
   await run("npx", ["wrangler", "deploy"], { cwd: WORKER_DIR }).catch(() => {});
+  await publishSetupToken(setupToken);
 
   writeConfig({ mode: "cloud", podUrl: url, worker: name, db: dbName });
   log(`\n${c.green("✓ Pod is live:")} ${c.cyan(url)}`);
@@ -194,10 +199,58 @@ function patchPublicUrl(url) {
   writeFileSync(WRANGLER_TOML, toml);
 }
 
+/** Random 128-bit id written into wrangler.toml. One pod, one Durable Object. */
+function ensureOwnerPodId() {
+  let toml = readFileSync(WRANGLER_TOML, "utf8");
+  const current = toml.match(/OWNER_POD_ID\s*=\s*"([^"]*)"/);
+  if (current && current[1]) return current[1];
+  const id = randomBytes(16).toString("hex");
+  if (current) toml = toml.replace(/OWNER_POD_ID\s*=\s*"[^"]*"/, `OWNER_POD_ID = "${id}"`);
+  else toml = toml.replace(/\[vars\]\n/, `[vars]\nOWNER_POD_ID = "${id}"\n`);
+  writeFileSync(WRANGLER_TOML, toml);
+  log(c.dim(`pinned this pod to OWNER_POD_ID ${id}`));
+  return id;
+}
+
+/**
+ * One-time enrollment secret. Stored in gitignored .dev.vars (and, for cloud,
+ * as a Worker secret). It is not written into wrangler.toml.
+ */
+function writeSetupToken() {
+  const token = randomBytes(32).toString("hex");
+  const devVars = join(WORKER_DIR, ".dev.vars");
+  let text = existsSync(devVars) ? readFileSync(devVars, "utf8") : "";
+  if (/^SETUP_TOKEN=/m.test(text)) text = text.replace(/^SETUP_TOKEN=.*$/m, `SETUP_TOKEN=${token}`);
+  else text += `${text && !text.endsWith("\n") ? "\n" : ""}SETUP_TOKEN=${token}\n`;
+  writeFileSync(devVars, text, { mode: 0o600 });
+  return token;
+}
+
+async function publishSetupToken(token) {
+  log(`\nOne-time setup token — paste it on the first device, then delete it:`);
+  log(c.cyan(token));
+  try {
+    await run("npx", ["wrangler", "secret", "put", "SETUP_TOKEN"], {
+      cwd: WORKER_DIR,
+      input: `${token}\n`,
+      quiet: true,
+    });
+    log(c.dim("stored SETUP_TOKEN as a Worker secret"));
+  } catch (e) {
+    log(c.yellow(`Could not store SETUP_TOKEN on Cloudflare (${e.message}).`));
+    log(c.dim("Local .dev.vars has it for wrangler dev."));
+  }
+  log(c.dim("After the first device enrolls: npx wrangler secret delete SETUP_TOKEN"));
+}
+
 // ---- home mode ------------------------------------------------------------
 
 async function setupHome() {
   log(c.bold("\nHost your Pod at home (Cloudflare Tunnel)\n"));
+  ensureOwnerPodId();
+  const setupToken = writeSetupToken();
+  log(`\nOne-time setup token — paste it on the first device, then delete the line from .dev.vars:`);
+  log(c.cyan(setupToken));
   const cf = await checkCmd("cloudflared", ["--version"]);
   if (!cf) {
     throw new Error("cloudflared is not installed. See https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/");

@@ -71,29 +71,37 @@ readable across their own devices.
 ## Transport (`pod-do.js` + `inbox-routes.js`)
 
 - **Device → own Pod:** `POST /api/pod` with an Ed25519-signed bundle bound to
-  the device key (`sessionId = pubkey:sha256(publicKeyHex)`). The DO enforces a
-  device **allowlist** and routes by a stable `podId` so all of your devices hit
-  the same DO.
+  the device key (`sessionId = pubkey:sha256(publicKeyHex)`) and to this pod's
+  origin (`aud`). The worker routes every device to one pinned Durable Object
+  (`OWNER_POD_ID`). A client-supplied pod id is not a routing key.
 - **Inbound mail:** public `POST /api/inbox` accepts **only** valid signed E2E
-  envelopes, looks up the owner (by handle for DMs) in D1, and stores the
-  ciphertext into the owner's DO.
+  envelopes. Direct messages are delivered only when the recipient handle is
+  the pinned owner. Group mail goes to that same pinned pod. The worker records
+  `handle → pod id` only after the Durable Object accepts `PROVISION`.
 - **Store-and-forward:** the sender's DO holds an **outbox**; on PUT it schedules
   delivery (alarm) and retries with exponential backoff until the recipient Pod
   acks — covering briefly-offline home pods.
 
 DO tables: `authorized_devices`, `contacts`, `groups`, `messages`, `outbox`,
-`pod_meta`. The worker's D1 holds `pod_owner` (handle → pod_id routing) plus
-WebAuthn/rate-limit tables, all created at runtime.
+`pod_meta`. The worker's D1 holds `pod_owner` (handle → pinned pod id) plus
+rate-limit tables, all created at runtime.
 
 ## Multi-device & recovery
 
-- The first device to reach a fresh Pod TOFU-enrolls as **owner**; its key and
-  the **recovery public key** (your identity Ed25519 key) are stored in `pod_meta`.
+- The first device to reach a fresh Pod TOFU-enrolls as **owner**. When a
+  one-time `SETUP_TOKEN` secret is set, that first enrollment must present it.
+  The **recovery public key** (your identity Ed25519 key) is stored once in
+  `pod_meta`. A later `PROVISION` cannot replace it unless the current recovery
+  key signs the change.
 - A new device re-derives your identity from the phrase, then calls
-  `PUT /devices/recover` signed by the recovery key. The DO verifies the
-  signature against the enrolled `recovery_pub` and enrolls the new device.
-- Other devices can also be authorized directly by their signing key
-  (Settings → Paired devices).
+  `PUT /devices/recover`. The statement is signed by the recovery key, bound to
+  this pod's origin (`aud`), and accepted once. The DO checks it against the
+  enrolled `recovery_pub` and enrolls the new device.
+- `PUT /devices/reset` (same recovery signature, action `reset-devices`) removes
+  every device and enrolls only the caller. `DELETE /devices/:ed_pub` revokes
+  one device and cannot remove the last one.
+- An already-authorized device can authorize another (`PUT /devices/authorize`).
+  `LIST /devices` returns the full list so the UI can warn about a new device.
 
 ## Security posture summary
 

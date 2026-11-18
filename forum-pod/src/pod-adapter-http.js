@@ -6,7 +6,7 @@
  */
 
 import { loadMemberProfile, loadSigningMeta } from "./member-store.js";
-import { signBundle } from "./pod-signing.js";
+import { audienceFromPodUrl, signBundle } from "./pod-signing.js";
 import { enrichSignedEnvelope } from "./signing-envelope.js";
 
 const STORAGE_KEY = "forum.podProviderUrl";
@@ -23,11 +23,8 @@ function loadSessionMeta() {
 }
 
 export function httpProviderUrl() {
-  const envUrl = (
-    import.meta.env.VITE_SERVER_URL ||
-    import.meta.env.VITE_POD_PROVIDER_URL ||
-    ""
-  ).replace(/\/$/, "");
+  const viteEnv = import.meta.env ?? {};
+  const envUrl = (viteEnv.VITE_SERVER_URL || viteEnv.VITE_POD_PROVIDER_URL || "").replace(/\/$/, "");
   if (envUrl) {
     try {
       const envHost = new URL(envUrl).host;
@@ -78,11 +75,12 @@ export async function httpPodRpc(verb, path, data = null) {
     throw new Error("Sign in to your Pod first.");
   }
   const payload = { verb, path, data };
-  const signed = enrichSignedEnvelope(await signBundle(payload, sessionId));
   const base = httpProviderUrl();
   if (!base) {
     throw new Error("No Pod URL configured. Install the Personal Pod app or set one in Settings.");
   }
+  const aud = audienceFromPodUrl(base);
+  const signed = enrichSignedEnvelope(await signBundle(payload, sessionId, aud));
   const url = `${base}/api/pod${path === "/" ? "" : path}`;
   let res;
   try {

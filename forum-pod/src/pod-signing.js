@@ -15,6 +15,16 @@ function canonicalise(obj) {
   return JSON.stringify(sorted);
 }
 
+/** Origin of a pod URL. Signed bundles are bound to this audience. */
+export function audienceFromPodUrl(podUrl) {
+  if (!podUrl || typeof podUrl !== "string") return "";
+  try {
+    return new URL(podUrl).origin;
+  } catch {
+    return "";
+  }
+}
+
 function bytesToHex(bytes) {
   return Array.from(new Uint8Array(bytes))
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -147,11 +157,14 @@ export async function regenerateSigningKey() {
   return generateAndPersistSigningKey();
 }
 
-export async function signBundle(payload, _sessionHint) {
+export async function signBundle(payload, _sessionHint, aud) {
+  if (typeof aud !== "string" || !aud) {
+    throw new Error("missing_aud");
+  }
   const meta = await ensurePodSigningKey();
   const sessionId = meta.sessionId;
   const timestamp = new Date().toISOString();
-  const message = canonicalise({ payload, sessionId, timestamp });
+  const message = canonicalise({ payload, sessionId, timestamp, aud });
   const sig = await crypto.subtle.sign(
     { name: "Ed25519" },
     volatileSigningPrivateKey,
@@ -161,6 +174,7 @@ export async function signBundle(payload, _sessionHint) {
     payload,
     sessionId,
     timestamp,
+    aud,
     signature: bytesToHex(sig),
     publicKeyHex: meta.publicKeyHex,
   };

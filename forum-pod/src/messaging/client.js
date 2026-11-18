@@ -10,7 +10,7 @@
  * the recipient pod only ever handle sealed envelopes.
  */
 
-import { signBundle, ensurePodSigningKey } from "../pod-signing.js";
+import { audienceFromPodUrl, signBundle, ensurePodSigningKey } from "../pod-signing.js";
 import { enrichSignedEnvelope } from "../signing-envelope.js";
 import { httpProviderUrl } from "../pod-adapter-http.js";
 import { loadSigningMeta } from "../member-store.js";
@@ -20,6 +20,7 @@ import { loadIdentity, selfForCrypto } from "./identity.js";
 import {
   sealEnvelope,
   openDmEnvelope,
+  previewUnverifiedDm,
   openGroupEnvelope,
   randomGroupKey,
   canonical,
@@ -51,9 +52,12 @@ function podRoot(identity, base) {
 async function rpc(verb, path, data = null, opts = {}) {
   const identity = opts.identity || loadIdentity();
   if (!identity) throw new Error("Create your identity first.");
-  const signed = enrichSignedEnvelope(await signBundle({ verb, path, data }));
-  signed.podId = podIdFor(identity);
-  const url = `${podRoot(identity, opts.base)}/api/pod${path === "/" ? "" : path}`;
+  const root = podRoot(identity, opts.base);
+  const signed = enrichSignedEnvelope(
+    await signBundle({ verb, path, data }, null, audienceFromPodUrl(root))
+  );
+  if (opts.setupToken) signed.setupToken = opts.setupToken;
+  const url = `${root}/api/pod${path === "/" ? "" : path}`;
   let res;
   try {
     res = await fetch(url, {
@@ -82,8 +86,8 @@ export async function provisionPod(opts = {}) {
     "/",
     {
       handle: identity.handle,
-      pod_id: podIdFor(identity),
       // The phrase-derived identity key doubles as the pod-local recovery key.
+      // The pod id is the deployment pin; the client does not choose a route.
       recovery_pub: identity.edPublicKeyHex,
     },
     opts
@@ -105,9 +109,28 @@ export async function recoverDevice(opts = {}) {
   const devicePub = loadSigningMeta()?.publicKeyHex;
   if (!devicePub) throw new Error("no device signing key");
   const ts = new Date().toISOString();
-  const message = canonical({ action: "recover-device", ed_pub: devicePub, ts });
+  const aud = audienceFromPodUrl(podRoot(identity, opts.base));
+  const message = canonical({ action: "recover-device", ed_pub: devicePub, ts, aud });
   const recovery_sig = bytesToHex(ed25519.sign(new TextEncoder().encode(message), identity.edPrivateKey));
   return rpc("PUT", "/devices/recover", { ed_pub: devicePub, ts, recovery_sig }, opts);
+}
+
+/** Drop every authorized device except this one. Requires the recovery key. */
+export async function resetDevices(opts = {}) {
+  const identity = opts.identity || loadIdentity();
+  await ensurePodSigningKey();
+  const devicePub = loadSigningMeta()?.publicKeyHex;
+  if (!devicePub) throw new Error("no device signing key");
+  const ts = new Date().toISOString();
+  const aud = audienceFromPodUrl(podRoot(identity, opts.base));
+  const message = canonical({ action: "reset-devices", ed_pub: devicePub, ts, aud });
+  const recovery_sig = bytesToHex(ed25519.sign(new TextEncoder().encode(message), identity.edPrivateKey));
+  return rpc("PUT", "/devices/reset", { ed_pub: devicePub, ts, recovery_sig }, opts);
+}
+
+export async function revokeDevice(edPubHex, opts = {}) {
+  const ed = String(edPubHex || "").toLowerCase();
+  return rpc("DELETE", `/devices/${encodeURIComponent(ed)}`, null, opts);
 }
 
 export async function listDevices(opts = {}) {
@@ -116,7 +139,20 @@ export async function listDevices(opts = {}) {
 
 // ---- contacts -------------------------------------------------------------
 
+export function contactKeysChanged(existing, card) {
+  if (!existing || !card) return false;
+  return existing.ed !== card.ed || existing.x !== card.x;
+}
+
 export async function addContact(card, opts = {}) {
+  if (!opts.confirmKeyChange) {
+    const existing = (await listContacts(opts)).find((r) => r.handle === card.handle);
+    if (contactKeysChanged(existing, card)) {
+      const err = new Error("Safety number changed. Confirm before accepting this contact's new keys.");
+      err.code = "safety_number_changed";
+      throw err;
+    }
+  }
   await rpc(
     "PUT",
     `/contacts/${encodeURIComponent(card.handle)}`,
@@ -187,23 +223,144 @@ export async function sendDm(contact, message, opts = {}) {
 
 // ---- groups ---------------------------------------------------------------
 
-function loadGroupKeys() {
+function loadGroupRecords() {
+  let all;
   try {
-    return JSON.parse(localStorage.getItem(GROUP_KEYS_STORE) || "{}");
+    all = JSON.parse(localStorage.getItem(GROUP_KEYS_STORE) || "{}");
   } catch {
-    return {};
+    all = {};
   }
+  const out = {};
+  for (const [id, value] of Object.entries(all || {})) {
+    if (typeof value === "string") {
+      out[id] = { key: value, epoch: 1, roster: [], creator: null };
+    } else if (value && typeof value === "object" && value.key) {
+      out[id] = {
+        key: value.key,
+        epoch: Number(value.epoch || 1),
+        roster: Array.isArray(value.roster) ? value.roster : [],
+        creator: value.creator || null,
+      };
+    }
+  }
+  return out;
 }
 
-function saveGroupKey(groupId, rawKeyB64) {
-  const all = loadGroupKeys();
-  all[groupId] = rawKeyB64;
+function writeGroupRecord(groupId, record) {
+  const all = JSON.parse(localStorage.getItem(GROUP_KEYS_STORE) || "{}");
+  all[groupId] = record;
   localStorage.setItem(GROUP_KEYS_STORE, JSON.stringify(all));
 }
 
+export function getGroupRecord(groupId) {
+  return loadGroupRecords()[groupId] || null;
+}
+
 export function getGroupRawKey(groupId) {
-  const b64 = loadGroupKeys()[groupId];
-  return b64 ? b64decode(b64) : null;
+  const rec = getGroupRecord(groupId);
+  return rec?.key ? b64decode(rec.key) : null;
+}
+
+function rosterHandles(roster) {
+  if (!Array.isArray(roster)) return [];
+  return roster.map((m) => (typeof m === "string" ? m : m?.handle)).filter(Boolean);
+}
+
+/**
+ * Decide whether a group-key control message may change the stored key.
+ * A non-roster sender never changes it. A real rotation sets `prompt` and
+ * leaves the stored key in place until the user accepts.
+ */
+export function groupKeyDecision(stored, incoming) {
+  const epoch = Number.isFinite(Number(incoming.epoch)) ? Number(incoming.epoch) : 1;
+  const handles = rosterHandles(incoming.roster);
+  if (!incoming.senderVerified) {
+    return { accept: false, prompt: false, reason: "unverified_sender", next: null };
+  }
+  if (stored && Array.isArray(stored.roster) && stored.roster.length > 0) {
+    const allowed = new Set(stored.roster);
+    if (stored.creator) allowed.add(stored.creator);
+    if (!allowed.has(incoming.senderHandle)) {
+      return { accept: false, prompt: false, reason: "not_on_roster", next: null };
+    }
+  } else if (stored?.creator && stored.creator !== incoming.senderHandle) {
+    return { accept: false, prompt: false, reason: "not_on_roster", next: null };
+  }
+  if (stored && stored.epoch != null && epoch < Number(stored.epoch)) {
+    return { accept: false, prompt: false, reason: "epoch_downgrade", next: null };
+  }
+  if (stored?.key && incoming.key && stored.key !== incoming.key) {
+    return {
+      accept: false,
+      prompt: true,
+      reason: "key_change",
+      next: null,
+      pending: {
+        key: incoming.key,
+        epoch,
+        roster: handles.length ? handles : stored.roster || [],
+        creator: stored.creator || incoming.senderHandle,
+      },
+    };
+  }
+  if (!stored) {
+    return {
+      accept: true,
+      prompt: false,
+      reason: "new",
+      next: {
+        key: incoming.key,
+        epoch,
+        roster: handles.length ? handles : [incoming.senderHandle],
+        creator: incoming.senderHandle,
+      },
+    };
+  }
+  return {
+    accept: true,
+    prompt: false,
+    reason: "unchanged",
+    next: { ...stored, epoch: Math.max(Number(stored.epoch || 1), epoch) },
+  };
+}
+
+/** Write a group key the user explicitly accepted. */
+export function acceptGroupKeyChange(groupId, pending) {
+  if (!groupId || !pending?.key) throw new Error("missing_group_key");
+  writeGroupRecord(groupId, {
+    key: pending.key,
+    epoch: Number(pending.epoch || 1),
+    roster: rosterHandles(pending.roster),
+    creator: pending.creator || null,
+  });
+}
+
+/** Must match `requestThreadId` in forum-pod-airlock/pod-do.js. */
+export function requestThreadId(from, fromEd) {
+  return `req:${from || "unknown"}:${fromEd || "unknown"}`;
+}
+
+/**
+ * A DM is verified only when `from` is us, or a stored contact whose ed and x
+ * match the envelope. Anything else is an unverified request.
+ */
+export function classifyDmSender(identity, envelope, contactsByHandle) {
+  if (
+    envelope.from === identity.handle &&
+    envelope.fromEd === identity.edPublicKeyHex &&
+    (!envelope.fromX || envelope.fromX === identity.xPublicKeyHex)
+  ) {
+    return { ok: true, self: true, peer: null };
+  }
+  const contact = contactsByHandle?.[envelope.from];
+  if (!contact || contact.ed !== envelope.fromEd || (envelope.fromX && contact.x !== envelope.fromX)) {
+    return { ok: false, reason: contact ? "sender_key_mismatch" : "unknown_sender" };
+  }
+  return {
+    ok: true,
+    self: false,
+    peer: { handle: contact.handle, ed: contact.ed, x: contact.x },
+  };
 }
 
 /** Create a group, store its key locally + sealed-to-self in the pod, and
@@ -214,18 +371,23 @@ export async function createGroup(title, members, opts = {}) {
   const groupId = "g-" + bytesToHex(crypto.getRandomValues(new Uint8Array(8)));
   const rawKey = randomGroupKey();
   const rawKeyB64 = b64encode(rawKey);
-  saveGroupKey(groupId, rawKeyB64);
-
   const roster = [
     { handle: identity.handle, x: identity.xPublicKeyHex, podUrl: identity.podUrl },
     ...members.map((m) => ({ handle: m.handle, x: m.x, podUrl: m.podUrl || m.pod_url })),
   ];
+  const rosterNames = roster.map((m) => m.handle);
+  writeGroupRecord(groupId, {
+    key: rawKeyB64,
+    epoch: 1,
+    roster: rosterNames,
+    creator: identity.handle,
+  });
 
   // Sealed-to-self copy of the key for our other devices.
   const sealedKey = sealEnvelope(
     self,
     { kind: "dm", toHandle: identity.handle, xPublicKeyHex: identity.xPublicKeyHex, threadId: `g:${groupId}` },
-    { type: "group-key", groupId, title, key: rawKeyB64, roster }
+    { type: "group-key", groupId, title, key: rawKeyB64, epoch: 1, roster }
   );
   await rpc(
     "PUT",
@@ -238,7 +400,7 @@ export async function createGroup(title, members, opts = {}) {
   for (const m of members) {
     await sendDm(
       { handle: m.handle, x: m.x, podUrl: m.podUrl || m.pod_url },
-      { type: "group-key", groupId, title, key: rawKeyB64, roster },
+      { type: "group-key", groupId, title, key: rawKeyB64, epoch: 1, roster },
       opts
     );
   }
@@ -279,10 +441,14 @@ export async function sendGroup(group, message, opts = {}) {
 
 /**
  * Decrypt a stored message row for display. Returns { direction, from, ts,
- * body, control } or null if it can't be decrypted. Also auto-imports group
- * keys delivered as 1:1 control messages.
+ * body, control } or null if it can't be decrypted.
+ *
+ * A sender whose handle matches a contact but whose keys do not is returned
+ * with `unverified` and a request thread id. It is never a message in that
+ * contact's thread. Group-key control messages update the stored key only
+ * when `groupKeyDecision` accepts them.
  */
-export function decryptRow(identity, row) {
+export function decryptRow(identity, row, contactsByHandle = {}) {
   let envelope;
   try {
     envelope = JSON.parse(row.envelope_json);
@@ -291,26 +457,68 @@ export function decryptRow(identity, row) {
   }
   const self = selfForCrypto(identity);
   let plaintext;
+  let classified = null;
   try {
     if (envelope.kind === "group") {
       const rawKey = getGroupRawKey(envelope.groupId);
       if (!rawKey) return { direction: row.direction, from: envelope.from, ts: envelope.ts, body: null, locked: true };
       plaintext = openGroupEnvelope(rawKey, envelope);
     } else {
-      // Both inbound messages and our own self-copies are sealed to us.
-      plaintext = openDmEnvelope(self, envelope);
+      classified = classifyDmSender(identity, envelope, contactsByHandle);
+      if (!classified.ok) {
+        let body = null;
+        try {
+          body = previewUnverifiedDm(self, envelope)?.body ?? null;
+        } catch {
+          body = null;
+        }
+        return {
+          direction: row.direction,
+          from: envelope.from,
+          ts: envelope.ts,
+          body,
+          unverified: true,
+          bucket: "requests",
+          reason: classified.reason,
+          threadId: requestThreadId(envelope.from, envelope.fromEd),
+        };
+      }
+      plaintext = openDmEnvelope(self, envelope, classified.peer);
     }
   } catch {
     return { direction: row.direction, from: envelope.from, ts: envelope.ts, body: null, error: true };
   }
   if (plaintext && plaintext.type === "group-key") {
-    saveGroupKey(plaintext.groupId, plaintext.key);
-    return { direction: row.direction, from: envelope.from, ts: envelope.ts, control: plaintext };
+    const stored = getGroupRecord(plaintext.groupId);
+    const decision = groupKeyDecision(stored, {
+      senderHandle: envelope.from,
+      senderVerified: !!classified?.ok,
+      key: plaintext.key,
+      epoch: plaintext.epoch,
+      roster: plaintext.roster,
+    });
+    if (decision.accept && decision.next) {
+      writeGroupRecord(plaintext.groupId, decision.next);
+    }
+    return {
+      direction: row.direction,
+      from: envelope.from,
+      ts: envelope.ts,
+      control: plaintext,
+      groupKeyAccepted: decision.accept,
+      groupKeyIgnored: !decision.accept && !decision.prompt,
+      groupKeyPrompt: decision.prompt
+        ? { groupId: plaintext.groupId, title: plaintext.title || "", from: envelope.from, ...decision.pending }
+        : null,
+      reason: decision.reason,
+      threadId: `dm:${envelope.from}`,
+    };
   }
   return {
     direction: row.direction,
     from: envelope.from,
     ts: envelope.ts,
     body: plaintext?.body ?? null,
+    threadId: envelope.kind === "group" ? `g:${envelope.groupId}` : `dm:${envelope.from}`,
   };
 }

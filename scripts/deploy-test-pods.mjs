@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomBytes } from "node:crypto";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const WORKER = join(ROOT, "forum-pod-airlock");
@@ -26,11 +27,12 @@ function run(args) {
   });
 }
 
-function patch({ name, dbId, publicUrl }) {
+function patch({ name, dbId, publicUrl, ownerPodId }) {
   let toml = readFileSync(TOML, "utf8");
   toml = toml.replace(/^name\s*=\s*".*"/m, `name = "${name}"`);
   toml = toml.replace(/database_id\s*=\s*"[^"]*"/g, `database_id = "${dbId}"`);
   toml = toml.replace(/PUBLIC_POD_URL\s*=\s*"[^"]*"/, `PUBLIC_POD_URL = "${publicUrl || ""}"`);
+  toml = toml.replace(/OWNER_POD_ID\s*=\s*"[^"]*"/, `OWNER_POD_ID = "${ownerPodId}"`);
   writeFileSync(TOML, toml);
 }
 
@@ -44,12 +46,13 @@ const results = {};
 try {
   for (const pod of PODS) {
     console.log(`\n=== deploying ${pod.name} ===`);
-    patch({ name: pod.name, dbId: pod.dbId, publicUrl: "" });
+    const ownerPodId = randomBytes(16).toString("hex");
+    patch({ name: pod.name, dbId: pod.dbId, publicUrl: "", ownerPodId });
     const out = await run(["wrangler", "deploy"]);
     const url = extractUrl(out);
     if (!url) throw new Error(`could not find workers.dev URL for ${pod.name}`);
     console.log(`URL: ${url}`);
-    patch({ name: pod.name, dbId: pod.dbId, publicUrl: url });
+    patch({ name: pod.name, dbId: pod.dbId, publicUrl: url, ownerPodId });
     await run(["wrangler", "deploy"]);
     results[pod.name] = url;
   }

@@ -1,15 +1,16 @@
 /**
- * PersonalPodDO — one Durable Object per device credential. Holds the
+ * PersonalPodDO — the owner's single pinned Durable Object. Holds the
  * user's private Pod data (contacts and E2E message threads) in SQLite.
  * The Worker authenticates each request against the Ed25519 device key
- * registered on first use (TOFU).
+ * registered on first use (TOFU), optionally gated by a one-time setup token.
  *
  * Wire model: every request is a signed bundle (see pod-signing-web.js).
  * The payload is `{ verb, path, data }`. The DO dispatches on verb+path
  * and returns JSON. This pod is the user's own; no cooperative, no AI.
  */
 
-import { verifySignedBundle } from "./pod-signing-web.js";
+import { audienceFromUrl, verifySignedBundle } from "./pod-signing-web.js";
+import { secretsEqual } from "./secret-compare.js";
 import { clampForumFeedbackComment } from "./feedback-limits.js";
 
 const META_KEY_PUBKEY = "registered_public_key";
@@ -236,6 +237,50 @@ export class PersonalPodDO {
     );
   }
 
+  pinnedId() {
+    return typeof this.env?.OWNER_POD_ID === "string" ? this.env.OWNER_POD_ID.trim() : "";
+  }
+
+  /**
+   * Audience for this request. The configured pod origin wins. A header that
+   * disagrees with it is rejected so a bundle signed for another pod cannot
+   * be replayed here.
+   */
+  resolveAud(request) {
+    const configured = audienceFromUrl(this.env?.PUBLIC_POD_URL || "");
+    const header = String(request.headers.get("X-Pod-Aud") || "").trim();
+    if (configured && header && header !== configured) {
+      this._audError = "aud_mismatch";
+      return "";
+    }
+    this._audError = null;
+    return configured || header || "";
+  }
+
+  /** First enrollment requires SETUP_TOKEN when that secret is configured. */
+  async tofuAllowed(bundle) {
+    const expected = this.env?.SETUP_TOKEN;
+    if (expected == null || expected === "") return true;
+    return secretsEqual(bundle?.setupToken, expected);
+  }
+
+  /**
+   * Verify a statement signed by the current recovery key and remember the
+   * signature so it cannot be replayed inside the timestamp window.
+   * `fields` is bound to this pod's audience.
+   */
+  async verifyRecoveryStatement(data, fields) {
+    const recoveryPub = this.getMeta("recovery_pub");
+    if (!recoveryPub || !data?.recovery_sig || !data?.ts) return false;
+    const tsMs = Date.parse(data.ts);
+    if (Number.isNaN(tsMs) || Math.abs(Date.now() - tsMs) > 5 * 60 * 1000) return false;
+    const message = canonicalObj({ ...fields, ts: data.ts, aud: this._aud || "" });
+    const ok = await verifyEd25519(recoveryPub, data.recovery_sig, message);
+    if (!ok) return false;
+    if (this.checkAndRecordReplay(data.recovery_sig, "recovery")) return false;
+    return true;
+  }
+
   /**
    * Recovery-signed device rebind. The caller proves possession of the
    * recovery key (the phrase-derived identity Ed25519 key enrolled at setup)
@@ -246,15 +291,101 @@ export class PersonalPodDO {
       return false;
     }
     const data = payload.data || {};
-    const recoveryPub = this.getMeta("recovery_pub");
-    if (!recoveryPub || !data.recovery_sig || !data.ts) return false;
-    const tsMs = Date.parse(data.ts);
-    if (Number.isNaN(tsMs) || Math.abs(Date.now() - tsMs) > 5 * 60 * 1000) return false;
-    const message = canonicalObj({ action: "recover-device", ed_pub: devicePubHex, ts: data.ts });
-    const ok = await verifyEd25519(recoveryPub, data.recovery_sig, message);
+    const ok = await this.verifyRecoveryStatement(data, {
+      action: "recover-device",
+      ed_pub: devicePubHex,
+    });
     if (!ok) return false;
     this.enrollDevice(devicePubHex, "recovered");
     return true;
+  }
+
+  /**
+   * "I lost my phone": a recovery signature wipes the device allowlist and
+   * enrolls only the calling device.
+   */
+  async tryResetDevices(payload, devicePubHex) {
+    if (!payload || payload.verb !== "PUT" || payload.path !== "/devices/reset") {
+      return false;
+    }
+    const data = payload.data || {};
+    const ok = await this.verifyRecoveryStatement(data, {
+      action: "reset-devices",
+      ed_pub: devicePubHex,
+    });
+    if (!ok) return false;
+    this.sql.exec(`DELETE FROM authorized_devices`);
+    this.enrollDevice(devicePubHex, "owner");
+    this.setMeta(META_KEY_PUBKEY, devicePubHex);
+    return true;
+  }
+
+  deviceRows() {
+    return this.sql
+      .exec(`SELECT ed_pub_hex, label, added_at FROM authorized_devices ORDER BY added_at`)
+      .toArray();
+  }
+
+  contactFor(handle) {
+    if (!handle) return null;
+    const rows = this.sql
+      .exec(`SELECT handle, ed, x FROM contacts WHERE handle = ?`, handle)
+      .toArray();
+    return rows[0] || null;
+  }
+
+  /**
+   * First PROVISION pins the owner handle, the deployment pod id, and the
+   * recovery key. Later calls cannot change them unless the current recovery
+   * key signs the change. The pod id is always the pinned id, never a
+   * client-chosen route.
+   */
+  async provision(data) {
+    const pinned = this.pinnedId();
+    if (!pinned) return { status: 500, body: { error: "pod_not_pinned" } };
+    if (data.webId && !this.getMeta(META_KEY_WEBID)) this.setMeta(META_KEY_WEBID, data.webId);
+
+    const existingHandle = this.getMeta("owner_handle");
+    const nextHandle = data.handle ? String(data.handle) : "";
+    if (!existingHandle && nextHandle) {
+      this.setMeta("owner_handle", nextHandle);
+    } else if (existingHandle && nextHandle && nextHandle !== existingHandle) {
+      const ok = await this.verifyRecoveryStatement(data, {
+        action: "rebind-owner",
+        handle: nextHandle,
+      });
+      if (ok) this.setMeta("owner_handle", nextHandle);
+    }
+
+    // Always the deployment pin. A client-supplied pod_id is ignored.
+    this.setMeta("pod_id", pinned);
+
+    const wantsRecovery =
+      data.recovery_pub && /^[0-9a-f]{64}$/i.test(String(data.recovery_pub))
+        ? String(data.recovery_pub).toLowerCase()
+        : "";
+    const existingRecovery = this.getMeta("recovery_pub");
+    if (!existingRecovery && wantsRecovery) {
+      this.setMeta("recovery_pub", wantsRecovery);
+    } else if (existingRecovery && wantsRecovery && wantsRecovery !== existingRecovery) {
+      const ok = await this.verifyRecoveryStatement(data, {
+        action: "rotate-recovery",
+        recovery_pub: wantsRecovery,
+      });
+      if (ok) this.setMeta("recovery_pub", wantsRecovery);
+    }
+
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        webId: this.getMeta(META_KEY_WEBID) || null,
+        handle: this.getMeta("owner_handle"),
+        pod_id: this.getMeta("pod_id"),
+        podRoot: data.podRoot || null,
+        createdAt: this.getMeta(META_KEY_CREATED),
+      },
+    };
   }
 
   async fetch(request) {
@@ -285,8 +416,13 @@ export class PersonalPodDO {
       return jsonResp(400, { error: "invalid_json" });
     }
 
-    // Verify the Ed25519 signature is valid for the bundle's own key.
-    const verdict = await verifySignedBundle(bundle, null);
+    // The bundle signature covers `aud` (this pod's origin). A bundle signed
+    // for another pod fails here even if the device key is valid.
+    this._aud = this.resolveAud(request);
+    if (this._audError) {
+      return jsonResp(401, { error: "auth_failed", reason: this._audError });
+    }
+    const verdict = await verifySignedBundle(bundle, null, REPLAY_WINDOW_MS, this._aud || null);
     if (!verdict.valid) {
       return jsonResp(401, { error: "auth_failed", reason: verdict.reason });
     }
@@ -301,22 +437,25 @@ export class PersonalPodDO {
     }
 
     // Device allowlist. The first device to reach a fresh pod is enrolled
-    // as the owner (TOFU). Every later device must already be authorized
-    // (added via the paired-device flow by an existing device).
+    // as the owner (TOFU), and only while SETUP_TOKEN matches when that
+    // secret is set. Every later device must already be authorized, or must
+    // present a recovery signature to re-pair or reset the allowlist.
+    this._recoveryAction = null;
     if (!this.isAuthorizedDevice(publicKeyHex)) {
       if (this.deviceCount() === 0) {
+        if (!(await this.tofuAllowed(bundle))) {
+          return jsonResp(401, { error: "auth_failed", reason: "setup_required" });
+        }
         this.enrollDevice(publicKeyHex, "owner");
         this.setMeta(META_KEY_PUBKEY, publicKeyHex);
         this.setMeta(META_KEY_SESSION, sessionId);
         this.setMeta(META_KEY_CREATED, new Date().toISOString());
+      } else if (await this.tryRecoverDevice(payload, publicKeyHex)) {
+        this._recoveryAction = "recover";
+      } else if (await this.tryResetDevices(payload, publicKeyHex)) {
+        this._recoveryAction = "reset";
       } else {
-        // Allow a recovery-signed device rebind: prove possession of the
-        // recovery key (the phrase-derived identity key) to enroll this
-        // device after losing the original.
-        const recovered = await this.tryRecoverDevice(payload, publicKeyHex);
-        if (!recovered) {
-          return jsonResp(401, { error: "auth_failed", reason: "device_not_authorized" });
-        }
+        return jsonResp(401, { error: "auth_failed", reason: "device_not_authorized" });
       }
     }
     this.setMeta(META_KEY_LAST_TOUCH, new Date().toISOString());
@@ -347,24 +486,7 @@ export class PersonalPodDO {
     const now = new Date().toISOString();
 
     if (verb === "PROVISION") {
-      if (data.webId) this.setMeta(META_KEY_WEBID, data.webId);
-      if (data.handle) this.setMeta("owner_handle", data.handle);
-      if (data.pod_id) this.setMeta("pod_id", data.pod_id);
-      // Enroll the recovery public key (the phrase-derived identity Ed25519
-      // key) so a fresh device can re-pair after device loss.
-      if (data.recovery_pub && /^[0-9a-f]{64}$/.test(data.recovery_pub)) {
-        this.setMeta("recovery_pub", data.recovery_pub);
-      }
-      return {
-        status: 200,
-        body: {
-          ok: true,
-          webId: data.webId || this.getMeta(META_KEY_WEBID) || null,
-          handle: this.getMeta("owner_handle"),
-          podRoot: data.podRoot || null,
-          createdAt: this.getMeta(META_KEY_CREATED),
-        },
-      };
+      return this.provision(data);
     }
 
     // ---- device pairing ----------------------------------------------------
@@ -373,19 +495,41 @@ export class PersonalPodDO {
       if (!/^[0-9a-f]{64}$/.test(edPub)) {
         return { status: 400, body: { error: "invalid_ed_pub" } };
       }
+      // Signed by a device already on the allowlist: that device is the
+      // confirmation. The full list is returned so the UI can warn.
       this.enrollDevice(edPub, data.label || "paired device");
-      return { status: 200, body: { ok: true, ed_pub: edPub } };
+      return { status: 200, body: { ok: true, ed_pub: edPub, rows: this.deviceRows() } };
+    }
+    if (verb === "DELETE" && path.startsWith("/devices/")) {
+      const edPub = decodeURIComponent(path.slice("/devices/".length)).toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(edPub)) {
+        return { status: 400, body: { error: "invalid_ed_pub" } };
+      }
+      if (!this.isAuthorizedDevice(edPub)) {
+        return { status: 404, body: { error: "device_not_found" } };
+      }
+      if (this.deviceCount() <= 1) {
+        return { status: 409, body: { error: "last_device" } };
+      }
+      this.sql.exec(`DELETE FROM authorized_devices WHERE ed_pub_hex = ?`, edPub);
+      return { status: 200, body: { ok: true, rows: this.deviceRows() } };
+    }
+    if (verb === "PUT" && path === "/devices/reset") {
+      if (this._recoveryAction !== "reset") {
+        const ok = await this.tryResetDevices({ verb, path, data }, this._device);
+        if (!ok) {
+          return { status: 401, body: { error: "auth_failed", reason: "recovery_required" } };
+        }
+      }
+      return { status: 200, body: { ok: true, reset: true, rows: this.deviceRows() } };
     }
     if (verb === "LIST" && path === "/devices") {
-      const rows = this.sql
-        .exec(`SELECT ed_pub_hex, label, added_at FROM authorized_devices ORDER BY added_at`)
-        .toArray();
-      return { status: 200, body: { rows } };
+      return { status: 200, body: { rows: this.deviceRows() } };
     }
     if (verb === "PUT" && path === "/devices/recover") {
       // Enrollment already happened in the recovery gate (tryRecoverDevice)
       // before dispatch; just acknowledge.
-      return { status: 200, body: { ok: true, recovered: true } };
+      return { status: 200, body: { ok: true, recovered: true, rows: this.deviceRows() } };
     }
 
     // ---- contacts ----------------------------------------------------------
@@ -690,8 +834,23 @@ export class PersonalPodDO {
     }
     const now = new Date().toISOString();
     const kind = envelope.kind === "group" ? "group" : "dm";
+    let unverified = false;
+    if (kind === "dm") {
+      const contact = this.contactFor(envelope.from);
+      const keysMatch =
+        contact &&
+        contact.ed &&
+        contact.ed === envelope.fromEd &&
+        (!envelope.fromX || !contact.x || contact.x === envelope.fromX);
+      // Unknown handles and key mismatches stay out of dm:<handle>.
+      unverified = !keysMatch;
+    }
     const threadId =
-      kind === "group" ? `g:${envelope.groupId}` : `dm:${envelope.from}`;
+      kind === "group"
+        ? `g:${envelope.groupId}`
+        : unverified
+          ? requestThreadId(envelope.from, envelope.fromEd)
+          : `dm:${envelope.from}`;
     const msgId = envelope.sig.slice(0, 48);
     this.sql.exec(
       `INSERT OR IGNORE INTO messages
@@ -705,7 +864,7 @@ export class PersonalPodDO {
       JSON.stringify(envelope),
       now
     );
-    return jsonResp(200, { ok: true, stored: true, thread_id: threadId });
+    return jsonResp(200, { ok: true, stored: true, thread_id: threadId, unverified });
   }
 
   /** Set an alarm to run outbox delivery after `delayMs` (if sooner than current). */
@@ -799,6 +958,11 @@ function jsonResp(status, body, extraHeaders = {}) {
     status,
     headers: { "Content-Type": "application/json", ...extraHeaders },
   });
+}
+
+/** Must match `requestThreadId` in forum-pod/src/messaging/client.js. */
+function requestThreadId(from, fromEd) {
+  return `req:${from || "unknown"}:${fromEd || "unknown"}`;
 }
 
 function canonicalObj(obj) {

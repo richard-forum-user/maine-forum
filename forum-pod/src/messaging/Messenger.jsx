@@ -22,7 +22,10 @@ import {
   sendGroup,
   listDevices,
   authorizeDevice,
+  revokeDevice,
+  resetDevices,
   decryptRow,
+  acceptGroupKeyChange,
   podRpc,
 } from "./client.js";
 
@@ -38,6 +41,7 @@ export default function Messenger() {
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
   const [toast, setToast] = useState(null);
+  const [pendingKey, setPendingKey] = useState(null);
   const scrollRef = useRef(null);
 
   const contactsByHandle = useMemo(() => {
@@ -66,16 +70,30 @@ export default function Messenger() {
     if (!active) return;
     try {
       const rows = await listMessages(active.id);
-      const decoded = rows
-        .map((r) => ({ row: r, dec: decryptRow(identity, r) }))
-        .filter((x) => x.dec && !x.dec.control);
-      setMessages(decoded);
+      const decoded = rows.map((r) => ({ row: r, dec: decryptRow(identity, r, contactsByHandle) }));
+      const prompt = decoded.find((x) => x.dec?.groupKeyPrompt);
+      setPendingKey(
+        prompt
+          ? {
+              ...prompt.dec.groupKeyPrompt,
+              from: prompt.dec.from,
+              title: prompt.dec.control?.title || prompt.dec.groupKeyPrompt.title,
+            }
+          : null
+      );
+      const requestThread = String(active.id).startsWith("req:");
+      const visible = decoded.filter((x) => {
+        if (!x.dec || x.dec.control) return false;
+        if (requestThread) return !!x.dec.unverified;
+        return !x.dec.unverified;
+      });
+      setMessages(visible);
       // flush outbox so delivery retries promptly
       podRpc("POST", "/outbox/flush").catch(() => {});
     } catch (e) {
       flash(e.message, "bad");
     }
-  }, [active, identity, flash]);
+  }, [active, identity, flash, contactsByHandle]);
 
   useEffect(() => {
     refreshLists();
@@ -125,6 +143,9 @@ export default function Messenger() {
   }
 
   function threadTitle(th) {
+    if (String(th.thread_id).startsWith("req:")) {
+      return `Unverified · ${th.peer_handle || "unknown sender"}`;
+    }
     if (th.kind === "group") {
       const g = groups.find((x) => x.group_id === th.group_id);
       return g?.title || "Group";
@@ -186,6 +207,15 @@ export default function Messenger() {
               setDraft={setDraft}
               onSend={send}
               scrollRef={scrollRef}
+              pendingKey={pendingKey}
+              onAcceptKey={async () => {
+                if (!pendingKey) return;
+                acceptGroupKeyChange(pendingKey.groupId, pendingKey);
+                const who = contactsByHandle[pendingKey.from]?.display_name || pendingKey.from;
+                flash(`${who} rotated the key for ${pendingKey.title || "a group"}. Accepted.`);
+                setPendingKey(null);
+                await refreshActive();
+              }}
             />
           </>
         )}
@@ -246,41 +276,61 @@ function Header({ tab, setTab }) {
 }
 
 function ThreadList({ threads, active, onSelect, titleFor }) {
+  const requests = threads.filter((th) => String(th.thread_id).startsWith("req:"));
+  const chats = threads.filter((th) => !String(th.thread_id).startsWith("req:"));
+  const row = (th) => (
+    <div
+      key={th.thread_id}
+      onClick={() => onSelect(th)}
+      style={{
+        padding: "12px 16px",
+        cursor: "pointer",
+        borderBottom: `1px solid ${t.border}`,
+        background: active?.id === th.thread_id ? t.panel2 : "transparent",
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ fontWeight: 600 }}>
+          {th.kind === "group" ? "# " : ""}
+          {titleFor(th)}
+        </span>
+        <span style={{ fontSize: 11, color: t.faint }}>{relTime(th.last_at)}</span>
+      </div>
+      <div style={{ fontSize: 12, color: t.faint }}>
+        {th.n} message{th.n === 1 ? "" : "s"}
+      </div>
+    </div>
+  );
   return (
     <div style={{ width: 280, borderRight: `1px solid ${t.border}`, overflow: "auto", background: t.bg }}>
-      {threads.length === 0 && (
+      {chats.length === 0 && requests.length === 0 && (
         <div style={{ padding: 18, color: t.faint, fontSize: 13 }}>
           No conversations yet. Add a contact to start.
         </div>
       )}
-      {threads.map((th) => (
-        <div
-          key={th.thread_id}
-          onClick={() => onSelect(th)}
-          style={{
-            padding: "12px 16px",
-            cursor: "pointer",
-            borderBottom: `1px solid ${t.border}`,
-            background: active?.id === th.thread_id ? t.panel2 : "transparent",
-          }}
-        >
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <span style={{ fontWeight: 600 }}>
-              {th.kind === "group" ? "# " : ""}
-              {titleFor(th)}
-            </span>
-            <span style={{ fontSize: 11, color: t.faint }}>{relTime(th.last_at)}</span>
-          </div>
-          <div style={{ fontSize: 12, color: t.faint }}>
-            {th.n} message{th.n === 1 ? "" : "s"}
-          </div>
+      {chats.map(row)}
+      {requests.length > 0 && (
+        <div style={{ padding: "14px 16px 6px", fontSize: 11, fontWeight: 700, letterSpacing: 0.4, color: t.faint }}>
+          MESSAGE REQUESTS
         </div>
-      ))}
+      )}
+      {requests.map(row)}
     </div>
   );
 }
 
-function Conversation({ active, messages, identity, contactsByHandle, draft, setDraft, onSend, scrollRef }) {
+function Conversation({
+  active,
+  messages,
+  identity,
+  contactsByHandle,
+  draft,
+  setDraft,
+  onSend,
+  scrollRef,
+  pendingKey,
+  onAcceptKey,
+}) {
   if (!active) {
     return (
       <div style={{ flex: 1, display: "grid", placeItems: "center", color: t.faint }}>
@@ -288,19 +338,38 @@ function Conversation({ active, messages, identity, contactsByHandle, draft, set
       </div>
     );
   }
+  const request = String(active.id).startsWith("req:");
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
       <div style={{ padding: "12px 18px", borderBottom: `1px solid ${t.border}`, fontWeight: 600 }}>
         {active.kind === "group" ? "# " : ""}
         {active.title}
       </div>
+      {request && (
+        <div style={{ padding: "10px 18px", background: t.panel2, color: t.dim, fontSize: 13, lineHeight: 1.45 }}>
+          Message request. This sender is not a verified contact, so it is not in an existing thread.
+        </div>
+      )}
+      {pendingKey && (
+        <div style={{ padding: "10px 18px", background: t.panel2, color: t.text, fontSize: 13, lineHeight: 1.45 }}>
+          {contactsByHandle[pendingKey.from]?.display_name || pendingKey.from} rotated the key for{" "}
+          {pendingKey.title || "a group"}. Accept?
+          <button style={{ ...S.btn("primary"), marginLeft: 10, padding: "4px 10px" }} onClick={onAcceptKey}>
+            Accept
+          </button>
+        </div>
+      )}
       <div ref={scrollRef} style={{ flex: 1, overflow: "auto", padding: 18, display: "flex", flexDirection: "column", gap: 10 }}>
         {messages.length === 0 && (
           <div style={{ color: t.faint, fontSize: 13 }}>No messages yet. Say hello.</div>
         )}
         {messages.map(({ row, dec }, i) => {
           const mine = dec.direction === "out";
-          const who = mine ? "You" : contactsByHandle[dec.from]?.display_name || dec.from;
+          const who = mine
+            ? "You"
+            : dec.unverified
+              ? `${dec.from || "unknown"} (unverified)`
+              : contactsByHandle[dec.from]?.display_name || dec.from;
           return (
             <div key={row.msg_id || i} style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "70%" }}>
               <div
@@ -353,18 +422,29 @@ function ContactsPanel({ contacts, groups, identity, onOpen, onChanged, flash })
   const [scanning, setScanning] = useState(false);
   const [groupTitle, setGroupTitle] = useState("");
   const [groupPicks, setGroupPicks] = useState({});
+  const [pendingCard, setPendingCard] = useState(null);
   const invite = identity ? encodeInvite(contactCard(identity)) : "";
 
-  async function addFromText(text) {
+  async function addFromText(text, confirmKeyChange = false) {
     setBusy(true);
     try {
       const card = decodeInvite(text);
-      await addContact(card);
+      await addContact(card, { confirmKeyChange });
       setCode("");
+      setPendingCard(null);
       flash(`Added ${card.displayName || card.handle}`);
       onChanged();
     } catch (e) {
-      flash(e.message, "bad");
+      if (e.code === "safety_number_changed") {
+        try {
+          setPendingCard(decodeInvite(text));
+        } catch {
+          /* invite already parsed once */
+        }
+        flash("Safety number changed. Confirm before accepting the new keys.", "bad");
+      } else {
+        flash(e.message, "bad");
+      }
     } finally {
       setBusy(false);
     }
@@ -414,6 +494,23 @@ function ContactsPanel({ contacts, groups, identity, onOpen, onChanged, flash })
             {showInvite ? "Hide my invite" : "Show my invite"}
           </button>
         </div>
+        {pendingCard && (
+          <div style={{ marginTop: 12, padding: 12, border: `1px solid ${t.bad}`, borderRadius: 10 }}>
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>Safety number changed</div>
+            <p style={{ color: t.dim, fontSize: 13, lineHeight: 1.5, margin: "0 0 10px" }}>
+              {pendingCard.displayName || pendingCard.handle} is already a contact, and the keys in this invite
+              are different. Accept only if you expected them to change.
+            </p>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button style={S.btn("primary", busy)} disabled={busy} onClick={() => addFromText(code || encodeInvite(pendingCard), true)}>
+                Accept new keys
+              </button>
+              <button style={S.btn("ghost")} onClick={() => setPendingCard(null)}>
+                Keep the old keys
+              </button>
+            </div>
+          </div>
+        )}
         {scanning && (
           <QrScanner
             onClose={() => setScanning(false)}
@@ -568,8 +665,12 @@ function SettingsPanel({ identity, flash }) {
   const [newDevice, setNewDevice] = useState("");
   const invite = identity ? encodeInvite(contactCard(identity)) : "";
 
+  function reloadDevices() {
+    return listDevices().then(setDevices).catch(() => {});
+  }
+
   useEffect(() => {
-    listDevices().then(setDevices).catch(() => {});
+    reloadDevices();
   }, []);
 
   return (
@@ -594,9 +695,34 @@ function SettingsPanel({ identity, flash }) {
           On a new device, enter your recovery phrase to restore this identity, then paste that
           device&apos;s signing key below to authorize it on this Pod.
         </p>
+        {devices.length > 1 && (
+          <p style={{ color: t.text, fontSize: 13, lineHeight: 1.5 }}>
+            More than one device can use this Pod. Revoke any device you don&apos;t recognize.
+          </p>
+        )}
         {devices.map((d) => (
-          <div key={d.ed_pub_hex} style={{ ...S.mono, padding: "6px 0", borderBottom: `1px solid ${t.border}` }}>
-            {d.label || "device"} · {d.ed_pub_hex.slice(0, 16)}…
+          <div key={d.ed_pub_hex} style={{ display: "flex", gap: 8, alignItems: "center", padding: "8px 0", borderBottom: `1px solid ${t.border}` }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 13 }}>{d.label || "device"}</div>
+              <div style={{ ...S.mono, fontSize: 11, color: t.faint }}>
+                {d.ed_pub_hex} · {relTime(d.added_at)}
+              </div>
+            </div>
+            <button
+              style={S.btn("danger", devices.length <= 1)}
+              disabled={devices.length <= 1}
+              onClick={async () => {
+                try {
+                  await revokeDevice(d.ed_pub_hex);
+                  flash("Device removed.");
+                  reloadDevices();
+                } catch (e) {
+                  flash(e.message, "bad");
+                }
+              }}
+            >
+              Revoke
+            </button>
           </div>
         ))}
         <input
@@ -605,22 +731,38 @@ function SettingsPanel({ identity, flash }) {
           placeholder="new device signing key (hex)"
           onChange={(e) => setNewDevice(e.target.value)}
         />
-        <button
-          style={S.btn("primary", !newDevice.trim())}
-          disabled={!newDevice.trim()}
-          onClick={async () => {
-            try {
-              await authorizeDevice(newDevice.trim().toLowerCase(), "paired device");
-              setNewDevice("");
-              flash("Device authorized.");
-              listDevices().then(setDevices).catch(() => {});
-            } catch (e) {
-              flash(e.message, "bad");
-            }
-          }}
-        >
-          Authorize device
-        </button>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button
+            style={S.btn("primary", !newDevice.trim())}
+            disabled={!newDevice.trim()}
+            onClick={async () => {
+              try {
+                await authorizeDevice(newDevice.trim().toLowerCase(), "paired device");
+                setNewDevice("");
+                flash("Device authorized. If you don't recognize it, revoke it.");
+                reloadDevices();
+              } catch (e) {
+                flash(e.message, "bad");
+              }
+            }}
+          >
+            Authorize device
+          </button>
+          <button
+            style={S.btn("danger")}
+            onClick={async () => {
+              try {
+                await resetDevices();
+                flash("Other devices were signed out. Only this device remains.");
+                reloadDevices();
+              } catch (e) {
+                flash(e.message, "bad");
+              }
+            }}
+          >
+            Reset to this device
+          </button>
+        </div>
       </div>
 
       {isTauri() && <HomeTunnelPanel flash={flash} />}

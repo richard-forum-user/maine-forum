@@ -38,8 +38,9 @@ const env = sealEnvelope(
   { kind: "dm", toHandle: bob.handle, xPublicKeyHex: bob.xPublicKeyHex, threadId: `dm:${bob.handle}` },
   { body: "hello bob, this is private" }
 );
+const alicePeer = { handle: alice.handle, ed: alice.edPublicKeyHex, x: alice.xPublicKeyHex };
 assert.ok(verifyEnvelopeSig(env), "signature should verify");
-const opened = openDmEnvelope(bob, env);
+const opened = openDmEnvelope(bob, env, alicePeer);
 assert.strictEqual(opened.body, "hello bob, this is private", "bob decrypts plaintext");
 console.log("[ok] 1:1 DM seal/verify/open round trip");
 
@@ -66,6 +67,22 @@ try {
 }
 assert.ok(failed, "non-recipient cannot decrypt");
 console.log("[ok] non-recipient cannot decrypt");
+
+// --- claimed sender must match the stored contact -------------------------
+const mallory = identityFrom(generateMnemonic(wordlist, 128), "https://mallory.example");
+const forged = sealEnvelope(
+  { ...mallory, handle: alice.handle },
+  { kind: "dm", toHandle: bob.handle, xPublicKeyHex: bob.xPublicKeyHex },
+  { body: "I am alice" }
+);
+let impersonated = false;
+try {
+  openDmEnvelope(bob, forged, alicePeer);
+} catch {
+  impersonated = true;
+}
+assert.ok(impersonated, "a different key cannot open as an existing contact");
+console.log("[ok] sender key must match the stored contact");
 
 // --- group round trip ------------------------------------------------------
 const gkey = randomGroupKey();
