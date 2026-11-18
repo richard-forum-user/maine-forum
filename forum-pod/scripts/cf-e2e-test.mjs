@@ -70,15 +70,16 @@ async function rpc(actor, verb, path, data = null) {
   const payload = { verb, path, data };
   const sessionId = await sessionIdFor(actor.devPubHex);
   const timestamp = new Date().toISOString();
-  const message = canonical({ payload, sessionId, timestamp });
+  const aud = new URL(actor.podUrl).origin;
+  const message = canonical({ payload, sessionId, timestamp, aud });
   const signature = bytesToHex(ed25519.sign(enc.encode(message), actor.devPriv));
   const bundle = {
     payload,
     sessionId,
     timestamp,
+    aud,
     signature,
     publicKeyHex: actor.devPubHex,
-    podId: actor.podId,
     deviceCredentialId: null,
   };
   const res = await fetch(`${actor.podUrl}/api/pod${path === "/" ? "" : path}`, {
@@ -151,7 +152,11 @@ assert.strictEqual(bobMsgs.length, 1, "Bob has 1 inbound message");
 const inbound = JSON.parse(bobMsgs[0].envelope_json);
 // ciphertext-only check: no plaintext present in stored envelope
 assert.ok(inbound.ct && !("body" in inbound) && !inbound.plaintext, "stored envelope is ciphertext-only");
-const opened = openDmEnvelope(bob.self, inbound);
+const opened = openDmEnvelope(bob.self, inbound, {
+  handle: alice.handle,
+  ed: alice.card.ed,
+  x: alice.card.x,
+});
 assert.strictEqual(opened.body, "hello bob — e2e over CF", "Bob decrypts Alice's message");
 console.log("[ok] Bob decrypted 1:1 message; pod stored ciphertext only");
 
@@ -196,8 +201,12 @@ try {
 }
 assert.ok(rejectedBeforeRecovery, "fresh device rejected before recovery");
 const rts = new Date().toISOString();
+const raud = new URL(bob.podUrl).origin;
 const rsig = bytesToHex(
-  ed25519.sign(enc.encode(canonical({ action: "recover-device", ed_pub: newDevPubHex, ts: rts })), bob.self.edPrivateKey)
+  ed25519.sign(
+    enc.encode(canonical({ action: "recover-device", ed_pub: newDevPubHex, ts: rts, aud: raud })),
+    bob.self.edPrivateKey
+  )
 );
 await rpc(bobNewDevice, "PUT", "/devices/recover", { ed_pub: newDevPubHex, ts: rts, recovery_sig: rsig });
 const recoveredList = await rpc(bobNewDevice, "LIST", "/contacts");

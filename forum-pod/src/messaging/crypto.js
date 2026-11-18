@@ -8,7 +8,8 @@
  *
  * Primitives:
  *   - X25519 (static-static ECDH) -> HKDF-SHA256 -> XChaCha20-Poly1305 AEAD
- *     for 1:1 direct messages.
+ *     for 1:1 direct messages. The shared key is derived from the stored
+ *     contact X25519 key, not from an unverified `fromX` in the envelope.
  *   - A random 32-byte group key + XChaCha20-Poly1305 for group channels;
  *     the group key itself is delivered to each member as a 1:1 message.
  *   - Ed25519 detached signature over the canonical envelope core for sender
@@ -160,12 +161,55 @@ export function verifyEnvelopeSig(envelope) {
   }
 }
 
-/** Decrypt a 1:1 envelope addressed to us, using the sender X key in the envelope. */
-export function openDmEnvelope(self, envelope) {
-  if (!verifyEnvelopeSig(envelope)) throw new Error("bad_signature");
-  if (!envelope.fromX) throw new Error("missing_sender_x_key");
-  const aeadKey = dmKey(self.xPrivateKey, envelope.fromX);
+function openSealedDm(self, theirXPubHex, envelope) {
+  if (!theirXPubHex) throw new Error("missing_sender_x_key");
+  const aeadKey = dmKey(self.xPrivateKey, theirXPubHex);
   return JSON.parse(open(aeadKey, envelope.nonce, envelope.ct));
+}
+
+/**
+ * X25519 public key to use for a DM.
+ * Self-copies use our own key. Everyone else must match a stored contact:
+ * `fromEd` and `fromX` are checked against that contact, and the key is
+ * derived from the stored `contact.x` (the envelope's fromX is not trusted).
+ */
+function boundSenderX(self, envelope, peer) {
+  const fromSelf =
+    !!self?.edPublicKeyHex &&
+    envelope.fromEd === self.edPublicKeyHex &&
+    (!self.handle || !envelope.from || envelope.from === self.handle);
+  if (fromSelf) {
+    if (self.xPublicKeyHex && envelope.fromX && envelope.fromX !== self.xPublicKeyHex) {
+      throw new Error("sender_key_mismatch");
+    }
+    return self.xPublicKeyHex;
+  }
+  if (!peer?.ed || !peer?.x) throw new Error("unverified_sender");
+  if (peer.handle && envelope.from && envelope.from !== peer.handle) {
+    throw new Error("sender_handle_mismatch");
+  }
+  if (envelope.fromEd !== peer.ed) throw new Error("sender_key_mismatch");
+  if (envelope.fromX && envelope.fromX !== peer.x) throw new Error("sender_key_mismatch");
+  return peer.x;
+}
+
+/**
+ * Decrypt a 1:1 envelope addressed to us.
+ * `peer` is the stored contact `{ handle, ed, x }` when the sender is not us.
+ */
+export function openDmEnvelope(self, envelope, peer = null) {
+  if (!verifyEnvelopeSig(envelope)) throw new Error("bad_signature");
+  return openSealedDm(self, boundSenderX(self, envelope, peer), envelope);
+}
+
+/**
+ * Decrypt a message for the unverified-request bucket only. The caller must
+ * not file the result on an existing contact thread. The signature still has
+ * to match the claimed fromEd; the claimed fromX opens the ciphertext.
+ */
+export function previewUnverifiedDm(self, envelope) {
+  if (!verifyEnvelopeSig(envelope)) throw new Error("bad_signature");
+  return openSealedDm(self, envelope.fromX, envelope);
 }
 
 /** Decrypt a group envelope using a known group key. */

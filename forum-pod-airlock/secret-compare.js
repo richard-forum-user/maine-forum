@@ -18,5 +18,12 @@ export async function secretsEqual(provided, expected) {
   const a = await digestSecret(provided);
   const b = await digestSecret(expected);
   if (a.length !== b.length) return false;
-  return crypto.subtle.timingSafeEqual(a, b);
+  // Workers provide timingSafeEqual. Node's Web Crypto (used by local tests)
+  // does not, so fall back to a fixed-length XOR of the hashes.
+  if (typeof crypto.subtle.timingSafeEqual === "function") {
+    return crypto.subtle.timingSafeEqual(a, b);
+  }
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
 }

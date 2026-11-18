@@ -109,16 +109,52 @@ async function applyIngressRateLimit(request, env, bucketSuffix, limit, windowMs
   return null;
 }
 
+function pinnedPodId(env) {
+  return typeof env?.OWNER_POD_ID === 'string' ? env.OWNER_POD_ID.trim() : '';
+}
+
+function audienceFromUrl(url) {
+  if (!url || typeof url !== 'string') return '';
+  try {
+    return new URL(url).origin;
+  } catch {
+    return '';
+  }
+}
+
+/** Pod origin bound into signed bundles. Configured URL wins over the request host. */
+function expectedAudience(env, request) {
+  const configured = audienceFromUrl(env?.PUBLIC_POD_URL || '');
+  if (configured) return configured;
+  try {
+    return new URL(request.url).origin;
+  } catch {
+    return '';
+  }
+}
+
 async function forwardPodRpc(request, env, bodyText, bundle) {
-  // Route by stable pod id (shared across the owner's devices) when present,
-  // falling back to the device session id for single-device use.
-  const routeName = bundle.podId || bundle.sessionId;
-  const id = env.POD.idFromName(routeName);
+  // One owner, one Durable Object. Client-supplied pod ids are not routing keys.
+  const pinned = pinnedPodId(env);
+  if (!pinned) {
+    return jsonResponse({ error: 'pod_not_pinned' }, 500);
+  }
+  if (bundle.podId != null && bundle.podId !== '' && bundle.podId !== pinned) {
+    return jsonResponse({ error: 'wrong_pod' }, 403);
+  }
+  const aud = expectedAudience(env, request);
+  if (!bundle.aud || bundle.aud !== aud) {
+    return jsonResponse(
+      { error: 'auth_failed', reason: bundle.aud ? 'aud_mismatch' : 'missing_aud' },
+      401
+    );
+  }
+  const id = env.POD.idFromName(pinned);
   const stub = env.POD.get(id);
   const upstream = await stub.fetch(
     new Request('https://pod-do/', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Pod-Aud': aud },
       body: bodyText,
     })
   );
@@ -204,17 +240,29 @@ export default {
           return jsonResponse({ error: budget.reason || 'pod_rate_limited' }, 429);
         }
       }
-      // Record handle -> pod-id routing so the public inbox can deliver mail
-      // to this owner's Durable Object across all their devices.
+      // Routing is recorded only after the DO accepts PROVISION, and only
+      // with the handle and pinned pod id the DO returns — never the request body.
       const pl = bundle.payload;
-      if (pl && pl.verb === 'PROVISION' && pl.data && pl.data.handle && pl.data.pod_id && env.DB) {
+      const upstream = await forwardPodRpc(request, env, bodyText, bundle);
+      if (
+        pl &&
+        pl.verb === 'PROVISION' &&
+        upstream.status >= 200 &&
+        upstream.status < 300 &&
+        env.DB
+      ) {
         try {
-          await recordPodOwner(env, pl.data.handle, pl.data.pod_id);
+          const accepted = JSON.parse(await upstream.clone().text());
+          const handle = accepted?.handle;
+          const podId = accepted?.pod_id;
+          if (handle && podId && podId === pinnedPodId(env)) {
+            await recordPodOwner(env, handle, podId);
+          }
         } catch {
-          /* non-fatal: inbox routing can be re-registered later */
+          /* non-fatal: a later successful PROVISION can register routing */
         }
       }
-      return forwardPodRpc(request, env, bodyText, bundle);
+      return upstream;
     }
 
     // Any non-API GET maps to the static asset bundle. Unmatched paths

@@ -49,6 +49,7 @@ export default function Wizard({ onDone }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [restoring, setRestoring] = useState(false);
+  const [setupToken, setSetupToken] = useState("");
   const [restorePhrase, setRestorePhrase] = useState("");
 
   const wrap = { ...S.app, display: "grid", placeItems: "center", padding: 20 };
@@ -77,13 +78,13 @@ export default function Wizard({ onDone }) {
       setHubMode(hubMode);
       updateIdentityFields({ podUrl: clean });
       try {
-        await provisionPod();
+        await provisionPod({ setupToken: setupToken.trim() });
       } catch (e) {
         // Restoring on a new device: this device isn't on the Pod's allowlist
         // yet. Prove the recovery key, enroll this device, then provision.
         if (/device_not_authorized|auth_failed/.test(e.message)) {
           await recoverDevice();
-          await provisionPod();
+          await provisionPod({ setupToken: setupToken.trim() });
         } else {
           throw e;
         }
@@ -277,10 +278,18 @@ export default function Wizard({ onDone }) {
               placeholder="https://podlink-pod.yourname.workers.dev"
               onChange={(e) => setPodUrlInput(e.target.value)}
             />
-            <p style={{ color: t.faint, fontSize: 12, lineHeight: 1.5, marginBottom: 16 }}>
+            <p style={{ color: t.faint, fontSize: 12, lineHeight: 1.5, marginBottom: 12 }}>
               Run <code>podlink setup</code> to create this, or paste the URL it printed. On desktop
               this is detected automatically.
             </p>
+            <label style={S.label}>Setup token (only for a brand-new Pod)</label>
+            <input
+              style={{ ...S.input, marginBottom: 16 }}
+              value={setupToken}
+              placeholder="Leave blank if your Pod is already enrolled"
+              onChange={(e) => setSetupToken(e.target.value)}
+              autoComplete="off"
+            />
             <div style={{ display: "flex", gap: 8 }}>
               <button style={S.btn("ghost")} onClick={() => setStep(1)}>
                 Back

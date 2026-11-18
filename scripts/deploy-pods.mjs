@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomBytes } from "node:crypto";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const WORKER = join(ROOT, "forum-pod-airlock");
@@ -50,11 +51,12 @@ async function ensureD1(dbName) {
   return id;
 }
 
-function patch({ name, dbId, publicUrl }) {
+function patch({ name, dbId, publicUrl, ownerPodId }) {
   let toml = readFileSync(TOML, "utf8");
   toml = toml.replace(/^name\s*=\s*".*"/m, `name = "${name}"`);
   toml = toml.replace(/database_id\s*=\s*"[^"]*"/g, `database_id = "${dbId}"`);
   toml = toml.replace(/PUBLIC_POD_URL\s*=\s*"[^"]*"/, `PUBLIC_POD_URL = "${publicUrl || ""}"`);
+  toml = toml.replace(/OWNER_POD_ID\s*=\s*"[^"]*"/, `OWNER_POD_ID = "${ownerPodId}"`);
   writeFileSync(TOML, toml);
 }
 
@@ -72,11 +74,12 @@ try {
     const dbName = `podlink-${base}-db`;
     console.log(`\n=== ${worker} (db ${dbName}) ===`);
     const dbId = await ensureD1(dbName);
-    patch({ name: worker, dbId, publicUrl: "" });
+    const ownerPodId = randomBytes(16).toString("hex");
+    patch({ name: worker, dbId, publicUrl: "", ownerPodId });
     const out = await run(["wrangler", "deploy"]);
     const url = extractUrl(out);
     if (!url) throw new Error(`no workers.dev URL for ${worker}`);
-    patch({ name: worker, dbId, publicUrl: url });
+    patch({ name: worker, dbId, publicUrl: url, ownerPodId });
     await run(["wrangler", "deploy"], { quiet: true });
     results[worker] = url;
     console.log(`URL: ${url}`);

@@ -13,10 +13,20 @@ const SPKI_PREFIX = new Uint8Array([
   0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ]);
 
-function canonicalise(obj) {
+export function canonicalise(obj) {
   const sorted = {};
   for (const k of Object.keys(obj).sort()) sorted[k] = obj[k];
   return JSON.stringify(sorted);
+}
+
+/** Origin of a pod URL. This is the `aud` bound into signed bundles. */
+export function audienceFromUrl(url) {
+  if (!url || typeof url !== "string") return "";
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
 }
 
 function hexToBytes(hex) {
@@ -59,12 +69,13 @@ async function importEd25519PublicKey(publicKeyHex) {
 export async function verifySignedBundle(
   bundle,
   expectedPublicKeyHex = null,
-  maxAgeMs = 5 * 60 * 1000
+  maxAgeMs = 5 * 60 * 1000,
+  expectedAud = null
 ) {
   if (!bundle || typeof bundle !== "object") {
     return { valid: false, reason: "missing_bundle" };
   }
-  const { payload, sessionId, timestamp, signature, publicKeyHex } = bundle;
+  const { payload, sessionId, timestamp, signature, publicKeyHex, aud } = bundle;
   if (
     payload === undefined ||
     !sessionId ||
@@ -73,6 +84,12 @@ export async function verifySignedBundle(
     !publicKeyHex
   ) {
     return { valid: false, reason: "invalid_structure" };
+  }
+  if (typeof aud !== "string" || !aud) {
+    return { valid: false, reason: "missing_aud" };
+  }
+  if (expectedAud && aud !== expectedAud) {
+    return { valid: false, reason: "aud_mismatch" };
   }
   const tsMs = Date.parse(timestamp);
   if (Number.isNaN(tsMs)) {
@@ -91,7 +108,7 @@ export async function verifySignedBundle(
   } catch (e) {
     return { valid: false, reason: `key_import_failed:${e.message}` };
   }
-  const canonical = canonicalise({ payload, sessionId, timestamp });
+  const canonical = canonicalise({ payload, sessionId, timestamp, aud });
   let sigBytes;
   try {
     sigBytes = hexToBytes(signature);
