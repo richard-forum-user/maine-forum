@@ -10,8 +10,11 @@
  */
 
 import { audienceFromUrl, verifySignedBundle } from "./pod-signing-web.js";
-import { secretsEqual } from "./secret-compare.js";
-import { clampForumFeedbackComment } from "./feedback-limits.js";
+import {
+  MAX_ENVELOPE_BYTES,
+  envelopeByteLength,
+  isDeliverablePodUrl,
+} from "./pod-url.js";
 
 const META_KEY_PUBKEY = "registered_public_key";
 const META_LAMPORT = "lamport_clock";
@@ -25,6 +28,8 @@ const META_KEY_LAST_TOUCH = "last_touch";
 // races a still-valid request.
 const REPLAY_WINDOW_MS = 5 * 60 * 1000;
 const REPLAY_CLEANUP_GRACE_MS = 60 * 1000;
+const MAX_UNKNOWN_PER_SENDER = 100;
+const MAX_UNKNOWN_TOTAL = 1000;
 
 export class PersonalPodDO {
   constructor(state, env) {
@@ -39,36 +44,6 @@ export class PersonalPodDO {
       CREATE TABLE IF NOT EXISTS pod_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS civic_submissions (
-        receipt_id TEXT PRIMARY KEY,
-        zip_code TEXT,
-        kind TEXT,
-        category_code TEXT,
-        category_id INTEGER,
-        category_label TEXT,
-        comment TEXT,
-        egress_status TEXT DEFAULT 'pending',
-        vault_status TEXT,
-        sync_attempts INTEGER DEFAULT 0,
-        last_error TEXT,
-        submitted_at TEXT,
-        share_status TEXT,
-        consent_at TEXT,
-        policy_version TEXT,
-        updated_at TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS email_proof (
-        id INTEGER PRIMARY KEY,
-        kind TEXT,
-        email_hash TEXT,
-        domain_hash TEXT,
-        proof_receipt TEXT,
-        claimed_email TEXT,
-        claimed_domain TEXT,
-        saved_at TEXT
       );
 
       -- Replay-protection cache keyed on the signature hex. The DO
@@ -165,6 +140,8 @@ export class PersonalPodDO {
       CREATE INDEX IF NOT EXISTS idx_outbox_status ON outbox(status, next_attempt_at_ms);
     `);
     this.sql.exec(`DROP TABLE IF EXISTS assistant_messages`);
+    this.sql.exec(`DROP TABLE IF EXISTS civic_submissions`);
+    this.sql.exec(`DROP TABLE IF EXISTS email_proof`);
   }
 
   bumpClock() {
@@ -654,8 +631,17 @@ export class PersonalPodDO {
       if (!outId) return { status: 400, body: { error: "missing_out_id" } };
       const toPodUrl = String(data.to_pod_url || "").replace(/\/$/, "");
       if (!toPodUrl) return { status: 400, body: { error: "missing_to_pod_url" } };
+      if (!isDeliverablePodUrl(toPodUrl)) {
+        return { status: 400, body: { error: "undeliverable_pod_url" } };
+      }
+      if (!this.destinationIsContact(toPodUrl)) {
+        return { status: 403, body: { error: "peer_not_a_contact" } };
+      }
       const envelopeJson =
         typeof data.envelope === "string" ? data.envelope : JSON.stringify(data.envelope || {});
+      if (envelopeByteLength(envelopeJson) > MAX_ENVELOPE_BYTES) {
+        return { status: 413, body: { error: "payload_too_large" } };
+      }
       this.sql.exec(
         `INSERT OR REPLACE INTO outbox
          (out_id, to_pod_url, envelope_json, status, attempts, next_attempt_at_ms, last_error, created_at)
@@ -680,70 +666,6 @@ export class PersonalPodDO {
     if (verb === "POST" && path === "/outbox/flush") {
       const result = await this.deliverOutbox();
       return { status: 200, body: result };
-    }
-
-    // civic_submissions
-    if (verb === "PUT" && path.startsWith("/civic/submissions/")) {
-      const id = path.slice("/civic/submissions/".length);
-      if (!id) return { status: 400, body: { error: "missing_id" } };
-      this.sql.exec(
-        `INSERT OR REPLACE INTO civic_submissions
-         (receipt_id, zip_code, kind, category_code, category_id, category_label,
-          comment, egress_status, vault_status, sync_attempts, last_error,
-          submitted_at, share_status, consent_at, policy_version, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        id,
-        data.zip_code || null,
-        data.kind || null,
-        data.category_code || null,
-        data.category_id != null ? Number(data.category_id) : null,
-        data.category_label || "",
-        clampForumFeedbackComment(data.comment || ""),
-        data.egress_status || "pending",
-        data.vault_status || null,
-        Number(data.sync_attempts || 0),
-        data.last_error || null,
-        data.submitted_at || now,
-        data.share_status || "private",
-        data.consent_at || null,
-        data.policy_version || null,
-        now
-      );
-      return { status: 200, body: { ok: true, id } };
-    }
-
-    if (verb === "LIST" && path === "/civic/submissions") {
-      const rows = this.sql
-        .exec(
-          `SELECT * FROM civic_submissions ORDER BY COALESCE(submitted_at, '') DESC`
-        )
-        .toArray();
-      return { status: 200, body: { rows } };
-    }
-
-    // email_proof (single-row table)
-    if (verb === "PUT" && path === "/identity/email-proof") {
-      this.sql.exec(`DELETE FROM email_proof`);
-      this.sql.exec(
-        `INSERT INTO email_proof
-         (id, kind, email_hash, domain_hash, proof_receipt, claimed_email, claimed_domain, saved_at)
-         VALUES (1, ?, ?, ?, ?, ?, ?, ?)`,
-        data.kind || "zk-email-dkim-v1",
-        data.email_hash || "",
-        data.domain_hash || null,
-        data.proof_receipt || null,
-        data.claimed_email || null,
-        data.claimed_domain || null,
-        data.saved_at || now
-      );
-      return { status: 200, body: { ok: true } };
-    }
-
-    if (verb === "GET" && path === "/identity/email-proof") {
-      const rows = this.sql
-        .exec(`SELECT * FROM email_proof WHERE id = 1`)
-        .toArray();
-      return { status: 200, body: rows[0] || null };
     }
 
     // pod_events — append-only audit log (device-signed payloads)
@@ -818,6 +740,51 @@ export class PersonalPodDO {
     return { status: 404, body: { error: "route_not_found", verb, path } };
   }
 
+  /** True when the destination origin is one of this pod's stored contacts. */
+  destinationIsContact(toPodUrl) {
+    let target;
+    try {
+      target = new URL(toPodUrl);
+    } catch {
+      return false;
+    }
+    const rows = this.sql.exec(`SELECT pod_url FROM contacts`).toArray();
+    return rows.some((row) => {
+      try {
+        return new URL(row.pod_url).origin === target.origin;
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  /**
+   * Keep unverified (message-request) mail bounded. Drop the oldest rows so
+   * one unknown sender cannot fill the pod, and so the pending set stays
+   * under the total cap.
+   */
+  trimUnknownSender(sender) {
+    const rows = this.sql
+      .exec(
+        `SELECT msg_id, peer_handle FROM messages WHERE thread_id LIKE 'req:%' ORDER BY rowid ASC`
+      )
+      .toArray();
+    const drop = new Set();
+    const fromSender = rows.filter((row) => row.peer_handle === sender);
+    const senderExcess = fromSender.length - (MAX_UNKNOWN_PER_SENDER - 1);
+    if (senderExcess > 0) {
+      for (const row of fromSender.slice(0, senderExcess)) drop.add(row.msg_id);
+    }
+    const remaining = rows.filter((row) => !drop.has(row.msg_id));
+    const totalExcess = remaining.length - (MAX_UNKNOWN_TOTAL - 1);
+    if (totalExcess > 0) {
+      for (const row of remaining.slice(0, totalExcess)) drop.add(row.msg_id);
+    }
+    for (const msgId of drop) {
+      this.sql.exec(`DELETE FROM messages WHERE msg_id = ?`, msgId);
+    }
+  }
+
   /**
    * Store an inbound sealed envelope (called Worker->DO from /api/inbox).
    * Plaintext is never present; we persist the ciphertext envelope as-is.
@@ -834,6 +801,13 @@ export class PersonalPodDO {
     }
     const now = new Date().toISOString();
     const kind = envelope.kind === "group" ? "group" : "dm";
+    if (kind === "group") {
+      const groupId = String(envelope.groupId || "");
+      const known = this.sql
+        .exec(`SELECT group_id FROM groups WHERE group_id = ?`, groupId)
+        .toArray();
+      if (!known.length) return jsonResp(404, { error: "unknown_group" });
+    }
     let unverified = false;
     if (kind === "dm") {
       const contact = this.contactFor(envelope.from);
@@ -852,6 +826,7 @@ export class PersonalPodDO {
           ? requestThreadId(envelope.from, envelope.fromEd)
           : `dm:${envelope.from}`;
     const msgId = envelope.sig.slice(0, 48);
+    if (unverified) this.trimUnknownSender(envelope.from);
     this.sql.exec(
       `INSERT OR IGNORE INTO messages
        (msg_id, thread_id, kind, direction, peer_handle, group_id, envelope_json, created_at)
@@ -901,6 +876,19 @@ export class PersonalPodDO {
     for (const row of pending) {
       let ok = false;
       let errText = null;
+      if (
+        !isDeliverablePodUrl(row.to_pod_url) ||
+        !this.destinationIsContact(row.to_pod_url) ||
+        envelopeByteLength(row.envelope_json) > MAX_ENVELOPE_BYTES
+      ) {
+        this.sql.exec(
+          `UPDATE outbox SET status = 'failed', last_error = ? WHERE out_id = ?`,
+          "undeliverable_pod_url",
+          row.out_id
+        );
+        failed++;
+        continue;
+      }
       try {
         const res = await fetch(`${row.to_pod_url}/api/inbox`, {
           method: "POST",
@@ -951,6 +939,26 @@ export class PersonalPodDO {
     await this._ready;
     await this.deliverOutbox();
   }
+}
+
+async function digestSecret(value) {
+  const bytes = new TextEncoder().encode(String(value ?? ""));
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  return new Uint8Array(hash);
+}
+
+/** Timing-safe compare for the one-time setup token. Empty input never matches. */
+async function secretsEqual(provided, expected) {
+  if (!provided || !expected) return false;
+  const a = await digestSecret(provided);
+  const b = await digestSecret(expected);
+  if (a.length !== b.length) return false;
+  if (typeof crypto.subtle.timingSafeEqual === "function") {
+    return crypto.subtle.timingSafeEqual(a, b);
+  }
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
 }
 
 function jsonResp(status, body, extraHeaders = {}) {
