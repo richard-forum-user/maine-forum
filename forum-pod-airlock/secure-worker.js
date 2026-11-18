@@ -144,11 +144,15 @@ async function forwardPodRpc(request, env, bodyText, bundle) {
   return new Response(text, { status: upstream.status, headers });
 }
 
-const SECURITY_TXT = `Contact: mailto:security@yourcommunity.forum
-Expires: 2027-05-26T00:00:00.000Z
-Preferred-Languages: en
-Canonical: https://pod.yourcommunity.forum/.well-known/security.txt
-`;
+function securityTxt(env, origin) {
+  const contact = typeof env?.SECURITY_CONTACT === "string" ? env.SECURITY_CONTACT.trim() : "";
+  if (!contact) return null;
+  const base = String(env?.PUBLIC_POD_URL || origin || "").replace(/\/$/, "");
+  const expires = new Date(Date.now() + 365 * 24 * 60 * 60 * 1000).toISOString();
+  const lines = [`Contact: ${contact}`, `Expires: ${expires}`, "Preferred-Languages: en"];
+  if (base) lines.push(`Canonical: ${base}/.well-known/security.txt`);
+  return `${lines.join("\n")}\n`;
+}
 
 export default {
   async fetch(request, env) {
@@ -163,7 +167,9 @@ export default {
     }
 
     if (url.pathname === '/.well-known/security.txt' && request.method === 'GET') {
-      return new Response(SECURITY_TXT, {
+      const body = securityTxt(env, url.origin);
+      if (!body) return jsonResponse({ error: 'route_not_found' }, 404);
+      return new Response(body, {
         headers: { 'Content-Type': 'text/plain; charset=utf-8', ...CORS, ...SECURITY_HEADERS },
       });
     }
@@ -282,10 +288,8 @@ export default {
       }
     }
 
-    return jsonResponse(
-      { error: 'route_not_found', path: url.pathname, method: request.method },
-      404
-    );
+    console.error('route not found', request.method, url.pathname);
+    return jsonResponse({ error: 'route_not_found' }, 404);
   },
 
   async scheduled(_event, env) {

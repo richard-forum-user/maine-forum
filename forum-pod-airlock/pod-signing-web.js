@@ -13,11 +13,8 @@ const SPKI_PREFIX = new Uint8Array([
   0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ]);
 
-export function canonicalise(obj) {
-  const sorted = {};
-  for (const k of Object.keys(obj).sort()) sorted[k] = obj[k];
-  return JSON.stringify(sorted);
-}
+import { canonicalise } from "./canonical-json.js";
+export { canonicalise };
 
 /** Origin of a pod URL. This is the `aud` bound into signed bundles. */
 export function audienceFromUrl(url) {

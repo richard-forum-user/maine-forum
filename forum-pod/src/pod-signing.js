@@ -8,12 +8,7 @@ import {
   clearSigningKeyStorage,
 } from "./member-store.js";
 import { deriveBoundSessionId } from "./session-id.js";
-
-function canonicalise(obj) {
-  const sorted = {};
-  for (const k of Object.keys(obj).sort()) sorted[k] = obj[k];
-  return JSON.stringify(sorted);
-}
+import { canonicalise } from "../../forum-pod-airlock/canonical-json.js";
 
 /** Origin of a pod URL. Signed bundles are bound to this audience. */
 export function audienceFromPodUrl(podUrl) {

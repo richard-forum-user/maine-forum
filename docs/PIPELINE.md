@@ -56,7 +56,9 @@ out-of-band as a `podlink://contact/…` invite (QR or text). No real-world PII.
 
 - **1:1:** `X25519 static-static ECDH → HKDF-SHA256 → XChaCha20-Poly1305` AEAD.
   The sender's X25519 public key travels in the envelope so the recipient can
-  derive the shared key.
+  derive the shared key. These are long-term keys. A leaked device key can
+  decrypt past and future direct messages with that contact. A later version
+  can seal each message to an ephemeral sender key, or use a ratchet.
 - **Group:** a random 32-byte group key + XChaCha20-Poly1305; the group key is
   delivered to each member as a 1:1 message (no server-side group state).
 - **Authenticity:** every envelope carries an **Ed25519 detached signature** over

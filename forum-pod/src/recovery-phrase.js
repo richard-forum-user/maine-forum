@@ -9,6 +9,7 @@ import { wordlist } from "@scure/bip39/wordlists/english.js";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
+import { canonicalise } from "../../forum-pod-airlock/canonical-json.js";
 
 const RECOVERY_KDF_INFO = "forum-recovery-v1";
 const RECOVERY_PUB_KEY = "forum.recoveryPubHex";
@@ -20,11 +21,7 @@ function bytesToHex(bytes) {
     .join("");
 }
 
-export function canonicalise(obj) {
-  const sorted = {};
-  for (const k of Object.keys(obj).sort()) sorted[k] = obj[k];
-  return JSON.stringify(sorted);
-}
+export { canonicalise };
 
 export function generateRecoveryPhrase() {
   return generateMnemonic(wordlist, 128);

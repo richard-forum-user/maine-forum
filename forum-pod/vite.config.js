@@ -31,6 +31,9 @@ export default defineConfig(() => {
     plugins: [react()],
     base: process.env.VITE_BASE || '/',
     server: {
+      fs: {
+        allow: [path.resolve(__dirname, '..')],
+      },
       sourcemapIgnoreList(sourcePath) {
         return sourcePath.includes('node_modules/@duckdb')
       },

@@ -7,6 +7,7 @@
  * It never sees plaintext and stores nothing readable itself.
  */
 
+import { canonicalise as canonical } from "./canonical-json.js";
 import {
   MAX_ENVELOPE_BYTES,
   envelopeByteLength,
@@ -16,12 +17,6 @@ import {
 const SPKI_PREFIX = new Uint8Array([
   0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ]);
-
-function canonical(obj) {
-  const sorted = {};
-  for (const k of Object.keys(obj).sort()) sorted[k] = obj[k];
-  return JSON.stringify(sorted);
-}
 
 function hexToBytes(hex) {
   if (typeof hex !== "string" || hex.length % 2 !== 0) throw new Error("hex");

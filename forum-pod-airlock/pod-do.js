@@ -9,6 +9,7 @@
  * and returns JSON. This pod is the user's own; no cooperative, no AI.
  */
 
+import { canonicalise as canonicalObj } from "./canonical-json.js";
 import { audienceFromUrl, verifySignedBundle } from "./pod-signing-web.js";
 import {
   MAX_ENVELOPE_BYTES,
@@ -452,10 +453,8 @@ export class PersonalPodDO {
       const result = await this.dispatch(verb, path, data);
       return jsonResp(result.status || 200, result.body ?? {});
     } catch (e) {
-      return jsonResp(500, {
-        error: "handler_failed",
-        reason: e?.message || String(e),
-      });
+      console.error("pod handler failed", e?.message || e);
+      return jsonResp(500, { error: "handler_failed" });
     }
   }
 
@@ -737,7 +736,8 @@ export class PersonalPodDO {
       return { status: 200, body: rows[0] || null };
     }
 
-    return { status: 404, body: { error: "route_not_found", verb, path } };
+    console.error("pod route not found", verb, path);
+    return { status: 404, body: { error: "route_not_found" } };
   }
 
   /** True when the destination origin is one of this pod's stored contacts. */
@@ -971,12 +971,6 @@ function jsonResp(status, body, extraHeaders = {}) {
 /** Must match `requestThreadId` in forum-pod/src/messaging/client.js. */
 function requestThreadId(from, fromEd) {
   return `req:${from || "unknown"}:${fromEd || "unknown"}`;
-}
-
-function canonicalObj(obj) {
-  const sorted = {};
-  for (const k of Object.keys(obj).sort()) sorted[k] = obj[k];
-  return JSON.stringify(sorted);
 }
 
 const ED_SPKI_PREFIX = new Uint8Array([
