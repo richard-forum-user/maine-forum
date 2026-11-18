@@ -13,6 +13,9 @@ OWNER_POD_ID = ""
 # in contact cards / invites so peers know where to deliver messages.
 # Set per deployment, e.g. https://podlink-pod.<subdomain>.workers.dev or your tunnel hostname.
 PUBLIC_POD_URL = ""
+# RFC 9116 contact (mailto: or https:). Empty means /.well-known/security.txt
+# is not published.
+SECURITY_CONTACT = ""
 
 [[d1_databases]]
 binding = "DB"

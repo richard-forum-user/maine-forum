@@ -262,8 +262,48 @@ export function getGroupRawKey(groupId) {
 }
 
 function rosterHandles(roster) {
+  return rosterMembers(roster).map((member) => member.handle);
+}
+
+/** Roster entries keep a handle and, when known, that member's Ed25519 key. */
+function rosterMembers(roster) {
   if (!Array.isArray(roster)) return [];
-  return roster.map((m) => (typeof m === "string" ? m : m?.handle)).filter(Boolean);
+  const members = [];
+  for (const entry of roster) {
+    if (typeof entry === "string" && entry) members.push({ handle: entry, ed: null });
+    else if (entry && typeof entry.handle === "string" && entry.handle) {
+      members.push({ handle: entry.handle, ed: entry.ed || null });
+    }
+  }
+  return members;
+}
+
+function rosterForStorage(roster) {
+  return rosterMembers(roster).map((member) =>
+    member.ed ? { handle: member.handle, ed: member.ed } : member.handle
+  );
+}
+
+/**
+ * A group message is shown as that member's only when `fromEd` is the Ed25519
+ * key stored for that handle. A group key alone is not permission to speak
+ * as someone else.
+ */
+export function groupSenderDecision(record, envelope, { self, contactsByHandle } = {}) {
+  if (!envelope?.from || !envelope?.fromEd) return { ok: false, reason: "not_on_roster" };
+  const members = rosterMembers(record?.roster);
+  const member = members.find((item) => item.handle === envelope.from);
+  const selfMatch =
+    !!self?.handle &&
+    !!self?.edPublicKeyHex &&
+    envelope.from === self.handle &&
+    envelope.fromEd === self.edPublicKeyHex;
+  if (!member && !selfMatch) return { ok: false, reason: "not_on_roster" };
+  if (selfMatch) return { ok: true, self: true };
+  const expectedEd = member.ed || contactsByHandle?.[envelope.from]?.ed || null;
+  if (!expectedEd) return { ok: false, reason: "sender_key_unknown" };
+  if (expectedEd !== envelope.fromEd) return { ok: false, reason: "sender_key_mismatch" };
+  return { ok: true };
 }
 
 /**
@@ -273,12 +313,11 @@ function rosterHandles(roster) {
  */
 export function groupKeyDecision(stored, incoming) {
   const epoch = Number.isFinite(Number(incoming.epoch)) ? Number(incoming.epoch) : 1;
-  const handles = rosterHandles(incoming.roster);
   if (!incoming.senderVerified) {
     return { accept: false, prompt: false, reason: "unverified_sender", next: null };
   }
-  if (stored && Array.isArray(stored.roster) && stored.roster.length > 0) {
-    const allowed = new Set(stored.roster);
+  if (stored && rosterHandles(stored.roster).length > 0) {
+    const allowed = new Set(rosterHandles(stored.roster));
     if (stored.creator) allowed.add(stored.creator);
     if (!allowed.has(incoming.senderHandle)) {
       return { accept: false, prompt: false, reason: "not_on_roster", next: null };
@@ -298,7 +337,9 @@ export function groupKeyDecision(stored, incoming) {
       pending: {
         key: incoming.key,
         epoch,
-        roster: handles.length ? handles : stored.roster || [],
+        roster: rosterForStorage(incoming.roster).length
+          ? rosterForStorage(incoming.roster)
+          : rosterForStorage(stored?.roster),
         creator: stored.creator || incoming.senderHandle,
       },
     };
@@ -311,7 +352,9 @@ export function groupKeyDecision(stored, incoming) {
       next: {
         key: incoming.key,
         epoch,
-        roster: handles.length ? handles : [incoming.senderHandle],
+        roster: rosterForStorage(incoming.roster).length
+          ? rosterForStorage(incoming.roster)
+          : [incoming.senderHandle],
         creator: incoming.senderHandle,
       },
     };
@@ -330,7 +373,7 @@ export function acceptGroupKeyChange(groupId, pending) {
   writeGroupRecord(groupId, {
     key: pending.key,
     epoch: Number(pending.epoch || 1),
-    roster: rosterHandles(pending.roster),
+    roster: rosterForStorage(pending.roster),
     creator: pending.creator || null,
   });
 }
@@ -372,14 +415,18 @@ export async function createGroup(title, members, opts = {}) {
   const rawKey = randomGroupKey();
   const rawKeyB64 = b64encode(rawKey);
   const roster = [
-    { handle: identity.handle, x: identity.xPublicKeyHex, podUrl: identity.podUrl },
-    ...members.map((m) => ({ handle: m.handle, x: m.x, podUrl: m.podUrl || m.pod_url })),
+    { handle: identity.handle, ed: identity.edPublicKeyHex, x: identity.xPublicKeyHex, podUrl: identity.podUrl },
+    ...members.map((m) => ({
+      handle: m.handle,
+      ed: m.ed,
+      x: m.x,
+      podUrl: m.podUrl || m.pod_url,
+    })),
   ];
-  const rosterNames = roster.map((m) => m.handle);
   writeGroupRecord(groupId, {
     key: rawKeyB64,
     epoch: 1,
-    roster: rosterNames,
+    roster: rosterForStorage(roster),
     creator: identity.handle,
   });
 
@@ -462,6 +509,21 @@ export function decryptRow(identity, row, contactsByHandle = {}) {
     if (envelope.kind === "group") {
       const rawKey = getGroupRawKey(envelope.groupId);
       if (!rawKey) return { direction: row.direction, from: envelope.from, ts: envelope.ts, body: null, locked: true };
+      const sender = groupSenderDecision(getGroupRecord(envelope.groupId), envelope, {
+        self: identity,
+        contactsByHandle,
+      });
+      if (!sender.ok) {
+        return {
+          direction: row.direction,
+          from: envelope.from,
+          ts: envelope.ts,
+          body: null,
+          unverified: true,
+          reason: sender.reason,
+          threadId: `g:${envelope.groupId}`,
+        };
+      }
       plaintext = openGroupEnvelope(rawKey, envelope);
     } else {
       classified = classifyDmSender(identity, envelope, contactsByHandle);

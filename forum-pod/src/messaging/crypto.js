@@ -16,6 +16,7 @@
  *     authenticity and tamper-evidence (also verified by the receiving pod).
  */
 
+import { canonicalise as canonical } from "../../../forum-pod-airlock/canonical-json.js";
 import { ed25519, x25519 } from "@noble/curves/ed25519.js";
 import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { hkdf } from "@noble/hashes/hkdf.js";
@@ -62,12 +63,8 @@ export function b64decode(b64) {
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-/** Deterministic JSON (sorted keys) — must match the worker verifier. */
-export function canonical(obj) {
-  const sorted = {};
-  for (const k of Object.keys(obj).sort()) sorted[k] = obj[k];
-  return JSON.stringify(sorted);
-}
+/** Deterministic JSON — the shared canonicalizer, re-exported for signers. */
+export { canonical };
 
 // ---- keys -----------------------------------------------------------------
 
