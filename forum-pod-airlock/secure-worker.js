@@ -1,19 +1,18 @@
 /**
- * podlink Pod Worker — UI assets, WebAuthn, PersonalPodDO RPC, and the
- * public E2E message inbox. The user's own Pod; no cooperative, no AI.
+ * podlink Pod Worker — UI assets, PersonalPodDO RPC, and the public E2E
+ * message inbox. The user's own Pod; no cooperative, no AI.
  */
 
 export { PersonalPodDO } from './pod-do.js';
 import { sessionIdMatchesPubkey } from './session-binding.js';
+import { checkRateLimit, clientIp, purgeStaleRateLimits } from './rate-limit.js';
 import {
-  issueUnlockToken,
-  isLocalDeviceCredentialId,
-  isPilotCredentialId,
-  verifyUnlockToken,
-} from './unlock-token.js';
-import { checkRateLimit, clientIp } from './rate-limit.js';
-import { checkPodWriteBudget, podBodyTooLarge } from './do-guards.js';
-import { handleWebAuthnRoute } from './webauthn-server.js';
+  MAX_POD_WRITES_PER_MINUTE,
+  checkPodWriteBudget,
+  podBodyTooLarge,
+  podWriteCount,
+  purgeStalePodUsage,
+} from './do-guards.js';
 import { handleInboxRoute, recordPodOwner } from './inbox-routes.js';
 
 const POD_API_PREFIX = '/api/pod';
@@ -26,7 +25,8 @@ const CORS = {
 
 const SECURITY_HEADERS = {
   'Content-Security-Policy':
-    "default-src 'self'; script-src 'self' blob: https://cdn.jsdelivr.net 'wasm-unsafe-eval'; script-src-elem 'self' https://cdn.jsdelivr.net; worker-src 'self' blob:; child-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https: blob:; frame-ancestors 'none'; base-uri 'none'",
+    "default-src 'self'; script-src 'self' blob: 'wasm-unsafe-eval'; script-src-elem 'self'; worker-src 'self' blob:; child-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
+  'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
   'Referrer-Policy': 'strict-origin-when-cross-origin',
   'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
@@ -48,7 +48,12 @@ function withSecurityHeaders(response) {
 function jsonResponse(body, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json', ...CORS, ...extraHeaders },
+    headers: {
+      'Content-Type': 'application/json',
+      ...CORS,
+      ...SECURITY_HEADERS,
+      ...extraHeaders,
+    },
   });
 }
 
@@ -63,41 +68,12 @@ async function assertSessionBinding(bundle) {
   return { ok: true };
 }
 
-async function assertUnlocked(env, bundle) {
-  if (!env.UNLOCK_TOKEN_KEY) {
-    return { ok: true, skipped: true };
-  }
-  const deviceCredentialId = bundle.deviceCredentialId || null;
-  if (isPilotCredentialId(deviceCredentialId)) {
-    if (env.ALLOW_PILOT_BUNDLES === '1') {
-      return { ok: true, pilot: true };
-    }
-    return { ok: false, reason: 'pilot_bundles_disabled' };
-  }
-  if (isLocalDeviceCredentialId(deviceCredentialId)) {
-    return { ok: true, local: true };
-  }
-  if (!deviceCredentialId) {
-    return { ok: false, reason: 'missing_device_credential_id' };
-  }
-  const verdict = await verifyUnlockToken(
-    env,
-    bundle.unlockToken,
-    bundle.signature,
-    env.DB
-  );
-  if (!verdict.ok) {
-    return verdict;
-  }
-  if (deviceCredentialId && deviceCredentialId !== verdict.credentialId) {
-    return { ok: false, reason: 'credential_mismatch' };
-  }
-  return { ok: true };
-}
-
 async function applyIngressRateLimit(request, env, bucketSuffix, limit, windowMs) {
   if (!env.DB) return null;
   const ip = clientIp(request);
+  // Without CF-Connecting-IP there is no trustworthy client address. Do not
+  // fall back to X-Forwarded-For or a shared "unknown" bucket.
+  if (!ip) return null;
   const verdict = await checkRateLimit(env.DB, `${bucketSuffix}:${ip}`, limit, windowMs);
   if (!verdict.ok) {
     return jsonResponse(
@@ -111,6 +87,11 @@ async function applyIngressRateLimit(request, env, bucketSuffix, limit, windowMs
 
 function pinnedPodId(env) {
   return typeof env?.OWNER_POD_ID === 'string' ? env.OWNER_POD_ID.trim() : '';
+}
+
+function podWriteBucket(env) {
+  const pinned = pinnedPodId(env);
+  return pinned ? `pod:${pinned}` : '';
 }
 
 function audienceFromUrl(url) {
@@ -159,7 +140,7 @@ async function forwardPodRpc(request, env, bodyText, bundle) {
     })
   );
   const text = await upstream.text();
-  const headers = { 'Content-Type': 'application/json', ...CORS };
+  const headers = { 'Content-Type': 'application/json', ...CORS, ...SECURITY_HEADERS };
   return new Response(text, { status: upstream.status, headers });
 }
 
@@ -174,7 +155,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === 'OPTIONS') {
-      return new Response(null, { status: 204, headers: CORS });
+      return new Response(null, { status: 204, headers: { ...CORS, ...SECURITY_HEADERS } });
     }
 
     if (url.pathname === '/' && request.method === 'GET') {
@@ -183,13 +164,12 @@ export default {
 
     if (url.pathname === '/.well-known/security.txt' && request.method === 'GET') {
       return new Response(SECURITY_TXT, {
-        headers: { 'Content-Type': 'text/plain; charset=utf-8', ...CORS },
+        headers: { 'Content-Type': 'text/plain; charset=utf-8', ...CORS, ...SECURITY_HEADERS },
       });
     }
 
-    if (url.pathname.startsWith('/api/webauthn/')) {
-      const webauthnRes = await handleWebAuthnRoute(request, env, url, issueUnlockToken);
-      if (webauthnRes) return webauthnRes;
+    if (url.pathname === '/api/webauthn' || url.pathname.startsWith('/api/webauthn/')) {
+      return jsonResponse({ error: 'route_not_found' }, 404);
     }
 
     // Public inbox: peers deliver E2E ciphertext envelopes here. The handler
@@ -199,7 +179,7 @@ export default {
       const rl = await applyIngressRateLimit(request, env, 'inbox', 240, 60_000);
       if (rl) return rl;
       const inboxRes = await handleInboxRoute(request, env, url);
-      return inboxRes;
+      return withSecurityHeaders(inboxRes);
     }
 
     if (url.pathname.startsWith(POD_API_PREFIX + '/') || url.pathname === POD_API_PREFIX) {
@@ -230,14 +210,13 @@ export default {
       if (!binding.ok) {
         return jsonResponse({ error: 'auth_failed', reason: binding.reason }, 401);
       }
-      // podlink has no passkey/unlock-token layer: device auth is the Ed25519
-      // signed bundle (verified above + in the DO) plus the DO device
-      // allowlist. The legacy WebAuthn unlock gate is intentionally not used.
-      const sessionId = bundle.sessionId;
-      if (env.DB) {
-        const budget = await checkPodWriteBudget(env.DB, sessionId);
-        if (!budget.ok) {
-          return jsonResponse({ error: budget.reason || 'pod_rate_limited' }, 429);
+      // Device auth is the Ed25519 signed bundle (verified above and in the
+      // DO) plus the DO device allowlist.
+      const writeBucket = podWriteBucket(env);
+      if (env.DB && writeBucket) {
+        const used = await podWriteCount(env.DB, writeBucket);
+        if (used >= MAX_POD_WRITES_PER_MINUTE) {
+          return jsonResponse({ error: 'pod_write_rate_exceeded' }, 429);
         }
       }
       // Routing is recorded only after the DO accepts PROVISION, and only
@@ -262,7 +241,17 @@ export default {
           /* non-fatal: a later successful PROVISION can register routing */
         }
       }
-      return upstream;
+      // Count the write only after the DO has accepted the device. The bucket
+      // is the pinned pod, so a caller cannot mint a fresh budget by rotating
+      // sessionId. Unauthorized attempts do not consume the owner's budget.
+      const authorized = upstream.status !== 401 && upstream.status !== 403 && upstream.status < 500;
+      if (authorized && env.DB && writeBucket) {
+        const budget = await checkPodWriteBudget(env.DB, writeBucket);
+        if (!budget.ok) {
+          return jsonResponse({ error: budget.reason || 'pod_rate_limited' }, 429);
+        }
+      }
+      return withSecurityHeaders(upstream);
     }
 
     // Any non-API GET maps to the static asset bundle. Unmatched paths
@@ -288,7 +277,7 @@ export default {
       } catch {
         return new Response(
           'Pod UI not found. Run: cd forum-pod-airlock && npm run build:pod',
-          { status: 404 }
+          { status: 404, headers: SECURITY_HEADERS }
         );
       }
     }
@@ -297,5 +286,10 @@ export default {
       { error: 'route_not_found', path: url.pathname, method: request.method },
       404
     );
+  },
+
+  async scheduled(_event, env) {
+    await purgeStaleRateLimits(env?.DB);
+    await purgeStalePodUsage(env?.DB);
   },
 };

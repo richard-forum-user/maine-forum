@@ -7,6 +7,12 @@
  * It never sees plaintext and stores nothing readable itself.
  */
 
+import {
+  MAX_ENVELOPE_BYTES,
+  envelopeByteLength,
+  envelopeFieldError,
+} from "./pod-url.js";
+
 const SPKI_PREFIX = new Uint8Array([
   0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ]);
@@ -109,24 +115,33 @@ export async function handleInboxRoute(request, env, url) {
   }
   if (!env.POD) return json({ error: "pod_do_not_bound" }, 500);
 
+  const declared = Number(request.headers.get("Content-Length") || 0);
+  if (Number.isFinite(declared) && declared > MAX_ENVELOPE_BYTES) {
+    return json({ error: "payload_too_large" }, 413);
+  }
+
+  let raw;
+  try {
+    raw = await request.text();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+  if (envelopeByteLength(raw) > MAX_ENVELOPE_BYTES) {
+    return json({ error: "payload_too_large" }, 413);
+  }
+
   let envelope;
   try {
-    envelope = await request.json();
+    envelope = JSON.parse(raw);
   } catch {
     return json({ error: "invalid_json" }, 400);
   }
 
-  // Structural validation — ciphertext-only envelopes.
-  const required = ["v", "alg", "kind", "from", "fromEd", "nonce", "ct", "sig"];
-  for (const f of required) {
-    if (envelope[f] == null) return json({ error: "invalid_envelope", missing: f }, 400);
+  const fieldError = envelopeFieldError(envelope);
+  if (fieldError === "ciphertext_too_large") {
+    return json({ error: "payload_too_large" }, 413);
   }
-  if (envelope.kind === "dm" && !envelope.to) {
-    return json({ error: "invalid_envelope", missing: "to" }, 400);
-  }
-  if (envelope.kind === "group" && !envelope.groupId) {
-    return json({ error: "invalid_envelope", missing: "groupId" }, 400);
-  }
+  if (fieldError) return json({ error: "invalid_envelope", reason: fieldError }, 400);
 
   const sigOk = await verifyEnvelopeSig(envelope);
   if (!sigOk) return json({ error: "bad_signature" }, 401);

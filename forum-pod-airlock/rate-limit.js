@@ -1,5 +1,7 @@
 /**
- * D1-backed sliding-window rate limits at the Worker edge.
+ * D1-backed fixed-window rate limits at the Worker edge.
+ * One atomic upsert increments and returns the count. Stale rows are
+ * removed by the Cron Trigger, not on the request path.
  */
 
 export async function ensureRateLimitSchema(db) {
@@ -25,35 +27,33 @@ export async function checkRateLimit(db, bucket, limit, windowMs) {
   const windowStart = Math.floor(now / windowMs) * windowMs;
   const row = await db
     .prepare(
-      `SELECT count FROM edge_rate_limits WHERE bucket = ? AND window_start_ms = ?`
+      `INSERT INTO edge_rate_limits (bucket, window_start_ms, count)
+       VALUES (?, ?, 1)
+       ON CONFLICT(bucket, window_start_ms) DO UPDATE SET count = count + 1
+       RETURNING count`
     )
     .bind(bucket, windowStart)
     .first();
   const count = Number(row?.count || 0);
-  if (count >= limit) {
+  if (count > limit) {
     const retryAfterSec = Math.ceil((windowStart + windowMs - now) / 1000);
     return { ok: false, retryAfterSec };
   }
-  await db
-    .prepare(
-      `INSERT INTO edge_rate_limits (bucket, window_start_ms, count)
-       VALUES (?, ?, 1)
-       ON CONFLICT(bucket, window_start_ms) DO UPDATE SET count = count + 1`
-    )
-    .bind(bucket, windowStart)
-    .run();
-  const cutoff = now - windowMs * 4;
-  await db
-    .prepare(`DELETE FROM edge_rate_limits WHERE window_start_ms < ?`)
-    .bind(cutoff)
-    .run();
   return { ok: true };
 }
 
+/** Drop windows older than an hour. Invoked from the scheduled handler. */
+export async function purgeStaleRateLimits(db, now = Date.now()) {
+  if (!db) return;
+  await ensureRateLimitSchema(db);
+  const cutoff = now - 60 * 60 * 1000;
+  await db.prepare(`DELETE FROM edge_rate_limits WHERE window_start_ms < ?`).bind(cutoff).run();
+}
+
+/** Cloudflare's client IP. No X-Forwarded-For and no shared "unknown" bucket. */
 export function clientIp(request) {
-  return (
-    request.headers.get('CF-Connecting-IP') ||
-    request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
-    'unknown'
-  );
+  const ip = request.headers.get("CF-Connecting-IP");
+  if (!ip) return null;
+  const trimmed = ip.trim();
+  return trimmed || null;
 }
